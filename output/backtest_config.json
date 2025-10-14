@@ -1,0 +1,21 @@
+{
+  "strategy_config": {
+    "lookback": 30,
+    "long_imbalance": 0.2,
+    "short_imbalance": -0.2,
+    "delta_threshold": 15.0,
+    "take_profit": 0.001,
+    "stop_loss": 0.0008,
+    "reverse_on_signal": true,
+    "initial_capital": 0.0
+  },
+  "stats": {
+    "total_trades": 56,
+    "win_rate": 0.375,
+    "avg_trade": -0.026671874999725072,
+    "cumulative_pnl": -1.493624999984604,
+    "max_drawdown": 14.704585999996198,
+    "sharpe": -59.933493413662944,
+    "profit_factor": 0.9676280325538958
+  }
+}
