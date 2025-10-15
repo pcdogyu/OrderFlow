@@ -1,0 +1,9 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Local virtual environments
+.vorderflow/
+.venv/
+env/
+venv/

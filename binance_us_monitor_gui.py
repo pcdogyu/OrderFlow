@@ -141,6 +141,32 @@ class InfluxPublisher:
         with self.lock:
             self.write_api.write(bucket=self.bucket, org=self.org, record=point)
 
+    def fetch_recent(self, symbol: str, seconds: int) -> List[Dict[str, Any]]:
+        symbol = symbol.upper()
+        query = (
+            f'from(bucket:"{self.bucket}") '
+            f'|> range(start: -{int(max(seconds, 60))}s) '
+            f'|> filter(fn:(r) => r["_measurement"] == "{self.measurement}" and r["symbol"] == "{symbol}") '
+            '|> pivot(rowKey:["_time"], columnKey:["_field"], valueColumn:"_value") '
+            '|> sort(columns:["_time"])'
+        )
+        try:
+            tables = self.client.query_api().query(query, org=self.org)
+        except Exception as exc:
+            print(f"[warn] failed to fetch history from InfluxDB: {exc}")
+            return []
+
+        records: Dict[pd.Timestamp, Dict[str, Any]] = {}
+        for table in tables:
+            for rec in table.records:
+                ts = pd.Timestamp(rec["_time"]).tz_convert(None)
+                entry = records.setdefault(ts, {"timestamp": ts})
+                field = rec.get_field()
+                entry[field] = rec.get_value()
+
+        ordered = [records[ts] for ts in sorted(records.keys())]
+        return ordered[-seconds:]
+
 
 class OrderFlowMonitor:
     """Background worker for a single trading pair."""
@@ -219,6 +245,30 @@ class OrderFlowMonitor:
                 break
 
     # ---------------------------------------------------------------- Aggregation
+    def seed_history(self, records: List[Dict[str, Any]]) -> None:
+        if not records:
+            return
+        ordered = sorted(records, key=lambda r: r["timestamp"])
+        self.stats = deque(ordered[-self.cfg.history_seconds:])
+        self.delta_window_values.clear()
+        self.cvd_window_values.clear()
+        self.delta_sum_value = 0.0
+        self.cvd_value = 0.0
+        if not self.stats:
+            return
+        last_ts = self.stats[-1]["timestamp"]
+        cutoff_delta = last_ts - pd.Timedelta(seconds=self.cfg.delta_window)
+        cutoff_cvd = last_ts - pd.Timedelta(seconds=self.cfg.cvd_window)
+        for rec in self.stats:
+            ts = rec["timestamp"]
+            delta_val = float(rec.get("delta", 0.0) or 0.0)
+            if ts >= cutoff_delta:
+                self.delta_window_values.append((ts, delta_val))
+                self.delta_sum_value += delta_val
+            if ts >= cutoff_cvd:
+                self.cvd_window_values.append((ts, delta_val))
+                self.cvd_value += delta_val
+
     def _update_window(
         self,
         buffer: Deque[Tuple[pd.Timestamp, float]],
@@ -374,14 +424,21 @@ class MonitorGUI:
         record_queue: "queue.Queue[Tuple[str, Dict[str, float]]]",
         stop_callback: Optional[Callable[[], None]] = None,
         preferred_font: Optional[str] = None,
+        initial_history: Optional[Dict[str, List[Dict[str, Any]]]] = None,
     ) -> None:
         self.cfg = cfg
         self.record_queue = record_queue
         self.stop_callback = stop_callback
 
-        self.records_by_symbol: Dict[str, List[Dict[str, float]]] = {
+        self.records_by_symbol: Dict[str, List[Dict[str, Any]]] = {
             symbol.upper(): [] for symbol in cfg.symbols
         }
+        if initial_history:
+            for symbol, items in initial_history.items():
+                symbol_upper = symbol.upper()
+                self.records_by_symbol[symbol_upper] = sorted(
+                    items, key=lambda x: x["timestamp"]
+                )[-cfg.history_seconds:]
 
         self.root = tk.Tk()
         self.preferred_font = preferred_font
@@ -402,6 +459,14 @@ class MonitorGUI:
         self._build_widgets()
         self._setup_plot()
 
+        if initial_history:
+            for symbol, records in initial_history.items():
+                symbol_upper = symbol.upper()
+                if symbol_upper in self.records_by_symbol and records:
+                    last = records[-1]
+                    self._update_metrics(symbol_upper, last)
+                    self._update_charts(symbol_upper)
+
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.update_ui()
 
@@ -410,11 +475,50 @@ class MonitorGUI:
         mainframe = ttk.Frame(self.root, padding="8 8 8 8")
         mainframe.pack(fill=tk.BOTH, expand=True)
 
+        control_frame = ttk.LabelFrame(mainframe, text="参数设置 Parameters", padding="6")
+        control_frame.pack(fill=tk.X, pady=(0, 6))
+
+        self.poll_interval_var = tk.DoubleVar(value=self.cfg.poll_interval)
+        self.delta_window_var = tk.IntVar(value=self.cfg.delta_window)
+        self.cvd_window_var = tk.IntVar(value=self.cfg.cvd_window)
+        self.history_seconds_var = tk.IntVar(value=self.cfg.history_seconds)
+
+        def add_control(col: int, text: str, var: Any, from_, to, increment, fmt: str) -> ttk.Spinbox:
+            frame = ttk.Frame(control_frame)
+            frame.grid(row=0, column=col, padx=4, pady=2, sticky="w")
+            ttk.Label(frame, text=text).pack(anchor="w")
+            spin = ttk.Spinbox(
+                frame,
+                from_=from_,
+                to=to,
+                increment=increment,
+                textvariable=var,
+                width=8,
+                format=fmt,
+            )
+            spin.pack(anchor="w")
+            return spin
+
+        control_frame.columnconfigure(0, weight=0)
+        control_frame.columnconfigure(1, weight=0)
+        control_frame.columnconfigure(2, weight=0)
+        control_frame.columnconfigure(3, weight=0)
+
+        add_control(0, "刷新周期(s)", self.poll_interval_var, 0.2, 5.0, 0.1, "%.2f")
+        add_control(1, "Delta窗口(s)", self.delta_window_var, 5, 600, 1, "%d")
+        add_control(2, "CVD窗口(s)", self.cvd_window_var, 10, 900, 1, "%d")
+        add_control(3, "图表秒数", self.history_seconds_var, 60, 3600, 30, "%d")
+
+        ttk.Button(control_frame, text="应用 Apply", command=self.apply_parameters).grid(
+            row=0, column=4, padx=8, pady=2
+        )
+
         metrics_frame = ttk.LabelFrame(mainframe, text="实时指标 Live Metrics", padding="6")
         metrics_frame.pack(fill=tk.X)
 
         self.metric_labels: Dict[str, Dict[str, tk.StringVar]] = {}
         self.metric_widgets: Dict[str, Dict[str, tk.Label]] = {}
+        self.heading_labels: Dict[str, Dict[str, ttk.Label]] = {}
 
         container = ttk.Frame(metrics_frame)
         container.pack(fill=tk.X)
@@ -442,15 +546,16 @@ class MonitorGUI:
                 "divergence": tk.StringVar(value="None"),
             }
             self.metric_labels[symbol_upper] = vars_map
+            self.heading_labels[symbol_upper] = {}
 
             label_widgets: Dict[str, tk.Label] = {}
 
             def add_item(col: int, title: str, subtitle: str, key: str) -> None:
                 cell = ttk.Frame(grid, padding="2")
                 cell.grid(row=0, column=col, sticky="w", padx=4)
-                ttk.Label(cell, text=f"{title}\n{subtitle}", font=self.heading_font).pack(
-                    anchor=tk.W
-                )
+                heading = ttk.Label(cell, text=f"{title}\n{subtitle}", font=self.heading_font)
+                heading.pack(anchor=tk.W)
+                self.heading_labels[symbol_upper][key] = heading
                 lbl = tk.Label(cell, textvariable=vars_map[key], font=self.value_font)
                 lbl.pack(anchor=tk.W)
                 label_widgets[key] = lbl
@@ -503,6 +608,44 @@ class MonitorGUI:
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
         self.time_formatter = time_formatter
 
+    def apply_parameters(self) -> None:
+        try:
+            poll_interval = max(0.2, float(self.poll_interval_var.get()))
+            delta_window = max(1, int(self.delta_window_var.get()))
+            cvd_window = max(1, int(self.cvd_window_var.get()))
+            history_seconds = max(60, int(self.history_seconds_var.get()))
+        except (TypeError, ValueError):
+            print("[warn] 参数格式错误，保持原值")
+            return
+
+        self.cfg.poll_interval = poll_interval
+        self.cfg.delta_window = delta_window
+        self.cfg.cvd_window = cvd_window
+        self.cfg.history_seconds = history_seconds
+
+        for symbol, headings in self.heading_labels.items():
+            if "delta_sum" in headings:
+                headings["delta_sum"].config(
+                    text=f"Δ Sum ({self.cfg.delta_window}s)\nDelta累积"
+                )
+            if "cvd" in headings:
+                headings["cvd"].config(text=f"CVD ({self.cfg.cvd_window}s)\n累积Delta")
+
+        cutoff = pd.Timestamp.utcnow() - pd.Timedelta(seconds=self.cfg.history_seconds)
+        for symbol in list(self.records_by_symbol.keys()):
+            self.records_by_symbol[symbol] = [
+                r for r in self.records_by_symbol[symbol] if r["timestamp"] >= cutoff
+            ]
+            if self.records_by_symbol[symbol]:
+                self._update_metrics(symbol, self.records_by_symbol[symbol][-1])
+                self._update_charts(symbol)
+
+        print(
+            f"[info] 参数已更新：poll={self.cfg.poll_interval}s, "
+            f"delta_window={self.cfg.delta_window}s, cvd_window={self.cfg.cvd_window}s, "
+            f"history={self.cfg.history_seconds}s"
+        )
+
     # ------------------------------------------------------------------ Updates
     def update_ui(self) -> None:
         updated_symbols: set[str] = set()
@@ -540,18 +683,25 @@ class MonitorGUI:
 
         self.root.after(int(self.cfg.poll_interval * 1000), self.update_ui)
 
-    def _update_metrics(self, symbol: str, record: Dict[str, float]) -> None:
+    def _update_metrics(self, symbol: str, record: Dict[str, Any]) -> None:
         labels = self.metric_labels[symbol]
         widgets = self.metric_widgets[symbol]
 
-        labels["time"].set(record["timestamp"].strftime("%H:%M:%S"))
-        labels["mid"].set(f"{record['mid']:.2f}")
-        labels["delta"].set(f"{record['delta']:.3f}")
-        labels["delta_sum"].set(f"{record['delta_sum']:.3f}")
-        labels["cvd"].set(f"{record['cvd']:.3f}")
+        timestamp = record.get("timestamp") or pd.Timestamp.utcnow()
+        labels["time"].set(pd.Timestamp(timestamp).strftime("%H:%M:%S"))
 
-        ob = record["ob_imbalance"]
-        if pd.isna(ob):
+        mid = record.get("mid")
+        labels["mid"].set(f"{mid:.2f}" if isinstance(mid, (int, float)) else "--")
+
+        delta = float(record.get("delta", 0.0) or 0.0)
+        delta_sum = float(record.get("delta_sum", 0.0) or 0.0)
+        cvd = float(record.get("cvd", 0.0) or 0.0)
+        labels["delta"].set(f"{delta:.3f}")
+        labels["delta_sum"].set(f"{delta_sum:.3f}")
+        labels["cvd"].set(f"{cvd:.3f}")
+
+        ob = record.get("ob_imbalance")
+        if ob is None or (isinstance(ob, float) and pd.isna(ob)):
             labels["ob"].set("NaN")
             widgets["ob"].configure(fg="#607d8b")
         else:
@@ -572,7 +722,6 @@ class MonitorGUI:
         else:
             widgets["divergence"].configure(fg="#37474f")
 
-        delta = record["delta"]
         if delta > 0:
             widgets["delta"].configure(fg="#2e7d32")
         elif delta < 0:
@@ -637,18 +786,26 @@ class MonitorGUI:
                 continue
 
             if "Bullish" in div_label:
-                ax_price.annotate(
-                    "",
-                    xy=(ts, price_y + min_offset * 0.5),
-                    xytext=(ts, price_y + min_offset * 1.6),
-                    arrowprops=dict(arrowstyle="-|>", color="#d32f2f", linewidth=1.6),
+                ax_price.scatter(
+                    ts,
+                    price_y + min_offset * 1.1,
+                    marker="v",
+                    s=120,
+                    color="#d32f2f",
+                    edgecolors="white",
+                    linewidths=0.6,
+                    zorder=6,
                 )
             elif "Bearish" in div_label:
-                ax_price.annotate(
-                    "",
-                    xy=(ts, price_y - min_offset * 0.5),
-                    xytext=(ts, price_y - min_offset * 1.6),
-                    arrowprops=dict(arrowstyle="-|>", color="#2e7d32", linewidth=1.6),
+                ax_price.scatter(
+                    ts,
+                    price_y - min_offset * 1.1,
+                    marker="^",
+                    s=120,
+                    color="#2e7d32",
+                    edgecolors="white",
+                    linewidths=0.6,
+                    zorder=6,
                 )
 
         if len(times) > 1:
@@ -740,9 +897,19 @@ def main() -> None:
         else:
             print("[warn] InfluxDB parameters incomplete; skipping export.")
 
+    initial_history: Dict[str, List[Dict[str, Any]]] = {}
+    if influx_publisher is not None:
+        for symbol in cfg.symbols:
+            history = influx_publisher.fetch_recent(symbol, cfg.history_seconds)
+            if history:
+                initial_history[symbol.upper()] = history
+
     monitors: List[OrderFlowMonitor] = []
     for symbol in cfg.symbols:
         monitor = OrderFlowMonitor(symbol, cfg, record_queue, publisher=influx_publisher)
+        symbol_upper = symbol.upper()
+        if symbol_upper in initial_history:
+            monitor.seed_history(initial_history[symbol_upper])
         monitor.start()
         monitors.append(monitor)
 
@@ -752,7 +919,13 @@ def main() -> None:
         if influx_publisher is not None:
             influx_publisher.close()
 
-    gui = MonitorGUI(cfg, record_queue, stop_callback=stop_monitors, preferred_font=chosen_font)
+    gui = MonitorGUI(
+        cfg,
+        record_queue,
+        stop_callback=stop_monitors,
+        preferred_font=chosen_font,
+        initial_history=initial_history,
+    )
 
     def handle_exit(_signum: int, _frame) -> None:
         gui.on_close()
