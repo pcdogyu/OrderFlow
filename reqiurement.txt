@@ -1,0 +1,4 @@
+pandas>=1.5
+matplotlib>=3.7
+websocket-client>=1.6
+influxdb-client>=1.40
