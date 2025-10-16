@@ -30,6 +30,7 @@ import queue
 import signal
 import threading
 import time
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 DISPLAY_TZ = ZoneInfo("Asia/Shanghai")
@@ -40,6 +41,8 @@ from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 import pandas as pd
 import websocket
+
+import coinpair
 
 import tkinter as tk
 import tkinter.font as tkfont
@@ -78,8 +81,8 @@ class SymbolSource:
 class MonitorConfig:
     symbol_sources: List[SymbolSource] = field(
         default_factory=lambda: [
-            SymbolSource("binanceus", "btcusdt"),
-            SymbolSource("binanceus", "ethusdt"),
+            SymbolSource("coinbase", "btc-usd"),
+            SymbolSource("okx", "btc-usdt"),
         ]
     )
     poll_interval: float = 0.5  # seconds
@@ -96,6 +99,51 @@ class MonitorConfig:
     influx_bucket: Optional[str] = None
     influx_measurement: str = "orderflow"
 
+
+
+
+
+ALL_OPTION = ALL_OPTION
+HOT_DEFAULT_OPTION = HOT_DEFAULT_OPTION
+HOT_EMPTY_OPTION = HOT_EMPTY_OPTION
+
+class SearchableCombobox(ttk.Combobox):
+    def __init__(self, master=None, *, values=None, **kwargs):
+        values = tuple(values or ())
+        state = kwargs.get('state')
+        if state == 'readonly':
+            kwargs['state'] = 'normal'
+        elif state is None:
+            kwargs['state'] = 'normal'
+        super().__init__(master, values=values, **kwargs)
+        self._all_values: tuple[str, ...] = tuple(values)
+        self.bind('<KeyRelease>', self._on_key_release)
+        self.bind('<<ComboboxSelected>>', self._restore_values)
+        self.bind('<FocusIn>', self._restore_values)
+
+    def set_values(self, values):
+        self._all_values = tuple(values or ())
+        self.configure(values=self._all_values)
+        self._restore_values()
+
+    def _restore_values(self, *_):
+        self.configure(values=self._all_values)
+
+    def _on_key_release(self, event):
+        if event.keysym in {'Return', 'KP_Enter', 'Up', 'Down', 'Left', 'Right', 'Tab'}:
+            return
+        if event.keysym == 'Escape':
+            self.set('')
+            self.configure(values=self._all_values)
+            return
+        typed = self.get()
+        if not typed:
+            self.configure(values=self._all_values)
+            return
+        filtered = [value for value in self._all_values if typed.lower() in value.lower()]
+        if not filtered:
+            filtered = self._all_values
+        self.configure(values=filtered)
 
 def configure_chinese_font() -> Optional[str]:
     preferred_fonts = ["Microsoft YaHei", "SimHei", "Noto Sans CJK SC", "PingFang SC"]
@@ -115,6 +163,7 @@ def configure_chinese_font() -> Optional[str]:
 
 
 COINBASE_QUOTES = ("usdt", "usdc", "usd", "eur", "gbp", "btc", "eth", "ada", "sol")
+OKX_SPOT_QUOTES = ("usdt", "usdc", "usd", "btc", "eth", "eur", "gbp", "jpy", "cnh")
 
 
 def normalize_exchange_symbol(exchange: str, symbol: str) -> Tuple[str, str]:
@@ -131,6 +180,24 @@ def normalize_exchange_symbol(exchange: str, symbol: str) -> Tuple[str, str]:
                         break
         if "-" not in symbol_l:
             raise ValueError(f"Unsupported Coinbase symbol format: {symbol}")
+    elif exchange_l == "okx":
+        if "-" not in symbol_l:
+            for quote in OKX_SPOT_QUOTES:
+                if symbol_l.endswith(quote):
+                    base = symbol_l[: -len(quote)]
+                    if base:
+                        symbol_l = f"{base}-{quote}"
+                        break
+        symbol_l = symbol_l.upper()
+        if symbol_l.count("-") == 1:
+            symbol_l = symbol_l.upper()
+        elif symbol_l.count("-") == 2:
+            symbol_l = symbol_l.upper()
+        else:
+            raise ValueError(f"Unsupported OKX symbol format: {symbol}")
+        symbol_l = symbol_l.upper()
+        symbol_l = symbol_l.replace("--", "-")
+        symbol_l = symbol_l.upper()
     return exchange_l, symbol_l
 
 
@@ -299,6 +366,13 @@ class OrderFlowMonitor:
             except ValueError as exc:
                 raise ValueError(f"Invalid Coinbase symbol '{self.symbol}'") from exc
             self.coinbase_product_id = normalized_symbol.upper()
+        self.okx_inst_id: Optional[str] = None
+        if self.exchange == "okx":
+            try:
+                _, normalized_symbol = normalize_exchange_symbol(self.exchange, self.symbol)
+            except ValueError as exc:
+                raise ValueError(f"Invalid OKX symbol '{self.symbol}'") from exc
+            self.okx_inst_id = normalized_symbol.upper()
 
         self.ticks: Deque[Tuple[pd.Timestamp, float, float, int]] = deque()
         self.book: Deque[Tuple[pd.Timestamp, float, float, float, float]] = deque()
@@ -328,7 +402,10 @@ class OrderFlowMonitor:
         return "wss://stream.bybit.com/v5/public/linear"
 
     def _coinbase_url(self) -> str:
-        return "wss://advanced-trade-ws.coinbase.com"
+        return "wss://ws-feed.exchange.coinbase.com"
+
+    def _okx_url(self) -> str:
+        return "wss://ws.okx.com:8443/ws/v5/public"
 
     def _bybit_subscribe(self, ws: websocket.WebSocketApp) -> None:
         args = [
@@ -337,14 +414,24 @@ class OrderFlowMonitor:
         ]
         ws.send(json.dumps({"op": "subscribe", "args": args}))
 
+    def _okx_subscribe(self, ws: websocket.WebSocketApp) -> None:
+        if not self.okx_inst_id:
+            return
+        payload = {"op": "subscribe", "args": [
+            {"channel": "trades", "instId": self.okx_inst_id},
+            {"channel": "books5", "instId": self.okx_inst_id},
+        ]}
+        ws.send(json.dumps(payload))
+
     def _coinbase_subscribe(self, ws: websocket.WebSocketApp) -> None:
         if not self.coinbase_product_id:
             return
         payload = {
             "type": "subscribe",
+            "product_ids": [self.coinbase_product_id],
             "channels": [
-                {"name": "market_trades", "product_ids": [self.coinbase_product_id]},
                 {"name": "ticker", "product_ids": [self.coinbase_product_id]},
+                {"name": "matches", "product_ids": [self.coinbase_product_id]},
             ],
         }
         ws.send(json.dumps(payload))
@@ -353,6 +440,8 @@ class OrderFlowMonitor:
         payload = json.loads(message)
         if self.exchange == "bybit":
             self._handle_bybit_message(payload)
+        elif self.exchange == "okx":
+            self._handle_okx_message(payload)
         elif self.exchange == "coinbase":
             self._handle_coinbase_message(payload)
         else:
@@ -426,42 +515,102 @@ class OrderFlowMonitor:
                 with self.lock:
                     self.book.append((ts, bid_price, bid_qty, ask_price, ask_qty))
 
+    def _handle_okx_message(self, payload: Dict[str, Any]) -> None:
+        if payload.get("event") in {"subscribe", "unsubscribe"}:
+            return
+        arg = payload.get("arg") or {}
+        channel = arg.get("channel") or payload.get("channel")
+        data = payload.get("data") or []
+        if not channel or not data:
+            return
+        now = self._ensure_naive(pd.Timestamp.utcnow())
+        if channel == "trades":
+            for item in data:
+                try:
+                    price = float(item.get("px"))
+                    qty = float(item.get("sz"))
+                except (TypeError, ValueError):
+                    continue
+                ts_raw = item.get("ts")
+                ts = self._parse_okx_timestamp(ts_raw, fallback=now)
+                side = str(item.get("side") or "").lower()
+                direction = 1 if side != "sell" else -1
+                with self.lock:
+                    self.ticks.append((ts, price, qty, direction))
+        elif channel == "books5":
+            item = data[0]
+            bids = item.get("bids") or []
+            asks = item.get("asks") or []
+            try:
+                bid_price = float(bids[0][0]) if bids else float('nan')
+                bid_qty = float(bids[0][1]) if bids else 0.0
+                ask_price = float(asks[0][0]) if asks else float('nan')
+                ask_qty = float(asks[0][1]) if asks else 0.0
+            except (TypeError, ValueError, IndexError):
+                return
+            ts_raw = item.get("ts")
+            ts = self._parse_okx_timestamp(ts_raw, fallback=now)
+            with self.lock:
+                self.book.append((ts, bid_price, bid_qty, ask_price, ask_qty))
+
+    def _parse_okx_timestamp(self, ts_raw: Any, fallback: pd.Timestamp) -> pd.Timestamp:
+        if ts_raw is None:
+            return fallback
+        try:
+            if isinstance(ts_raw, pd.Timestamp):
+                return self._ensure_naive(ts_raw)
+            if isinstance(ts_raw, (int, float)):
+                value_int = int(ts_raw)
+            else:
+                ts_str = str(ts_raw).strip()
+                if not ts_str:
+                    return fallback
+                if ts_str.isdigit():
+                    value_int = int(ts_str)
+                else:
+                    parsed = pd.Timestamp(ts_str)
+                    return self._ensure_naive(parsed)
+            digits = len(str(abs(value_int))) if value_int != 0 else 1
+            if digits >= 19:
+                ts = pd.Timestamp(value_int, unit="ns")
+            elif digits >= 16:
+                ts = pd.Timestamp(value_int, unit="us")
+            elif digits >= 13:
+                ts = pd.Timestamp(value_int, unit="ms")
+            else:
+                ts = pd.Timestamp(value_int, unit="s")
+            return self._ensure_naive(ts)
+        except Exception as exc:
+            print(f"[{self.symbol_key}] error: Parsing {ts_raw!r} to datetime failed ({exc})")
+            return fallback
+
     def _handle_coinbase_message(self, payload: Dict[str, Any]) -> None:
         msg_type = payload.get("type")
         product_id = payload.get("product_id") or payload.get("productId")
         if product_id and self.coinbase_product_id and product_id.upper() != self.coinbase_product_id:
             return
-        if msg_type in (None, "subscriptions", "heartbeat"):
+        if msg_type in (None, "subscriptions", "heartbeat", "snapshot", "l2update"):
             return
         if msg_type == "error":
             print(f"[{self.symbol_key}] coinbase error: {payload}")
             return
         now = self._ensure_naive(pd.Timestamp.utcnow())
-        if msg_type == "market_trades":
-            trades = payload.get("trades") or []
-            for trade in trades:
-                if not trade:
-                    continue
-                try:
-                    price = float(trade.get("price"))
-                    qty = float(trade.get("size") or trade.get("quantity"))
-                except (TypeError, ValueError):
-                    continue
-                ts_raw = (
-                    trade.get("trade_time")
-                    or trade.get("time")
-                    or trade.get("ts")
-                    or payload.get("time")
-                )
-                ts = self._ensure_naive(pd.Timestamp(ts_raw)) if ts_raw else now
-                side = str(trade.get("side") or trade.get("taker_side") or "").lower()
-                direction = 1 if side != "sell" else -1
-                with self.lock:
-                    self.ticks.append((ts, price, qty, direction))
+        if msg_type == "match":
+            try:
+                price = float(payload.get("price"))
+                qty = float(payload.get("size") or payload.get("last_size") or 0.0)
+            except (TypeError, ValueError):
+                return
+            ts_raw = payload.get("time")
+            ts = self._ensure_naive(pd.Timestamp(ts_raw)) if ts_raw else now
+            side = str(payload.get("side") or "").lower()
+            direction = 1 if side != "sell" else -1
+            with self.lock:
+                self.ticks.append((ts, price, qty, direction))
         elif msg_type == "ticker":
             try:
-                bid_price = float(payload.get("best_bid") or payload.get("bid_price"))
-                ask_price = float(payload.get("best_ask") or payload.get("ask_price"))
+                bid_price = float(payload.get("best_bid") or payload.get("bid"))
+                ask_price = float(payload.get("best_ask") or payload.get("ask"))
             except (TypeError, ValueError):
                 return
             try:
@@ -472,7 +621,7 @@ class OrderFlowMonitor:
                 ask_qty = float(payload.get("best_ask_size") or payload.get("ask_size") or 0.0)
             except (TypeError, ValueError):
                 ask_qty = 0.0
-            ts_raw = payload.get("time") or payload.get("ts")
+            ts_raw = payload.get("time")
             ts = self._ensure_naive(pd.Timestamp(ts_raw)) if ts_raw else now
             with self.lock:
                 self.book.append((ts, bid_price, bid_qty, ask_price, ask_qty))
@@ -484,42 +633,55 @@ class OrderFlowMonitor:
         print(f"[{self.symbol_key}] websocket closed")
 
     def run_ws(self) -> None:
-        if self.exchange == "bybit":
-            url = self._bybit_url()
-            self.ws_app = websocket.WebSocketApp(
-                url,
-                on_message=self.on_message,
-                on_error=self.on_error,
-                on_close=self.on_close,
-            )
-            self.ws_app.on_open = self._bybit_subscribe
-        elif self.exchange == "coinbase":
-            if not self.coinbase_product_id:
-                raise ValueError(f"Coinbase product id not resolved for {self.symbol_key}")
-            url = self._coinbase_url()
-            self.ws_app = websocket.WebSocketApp(
-                url,
-                on_message=self.on_message,
-                on_error=self.on_error,
-                on_close=self.on_close,
-            )
-            self.ws_app.on_open = self._coinbase_subscribe
-        else:
-            url = self._binance_url()
-            self.ws_app = websocket.WebSocketApp(
-                url,
-                on_message=self.on_message,
-                on_error=self.on_error,
-                on_close=self.on_close,
-            )
         while not self.stop_event.is_set():
+            if self.exchange == "bybit":
+                url = self._bybit_url()
+                self.ws_app = websocket.WebSocketApp(
+                    url,
+                    on_message=self.on_message,
+                    on_error=self.on_error,
+                    on_close=self.on_close,
+                )
+                self.ws_app.on_open = self._bybit_subscribe
+            elif self.exchange == "okx":
+                if not self.okx_inst_id:
+                    raise ValueError(f"OKX instrument not resolved for {self.symbol_key}")
+                url = self._okx_url()
+                self.ws_app = websocket.WebSocketApp(
+                    url,
+                    on_message=self.on_message,
+                    on_error=self.on_error,
+                    on_close=self.on_close,
+                )
+                self.ws_app.on_open = self._okx_subscribe
+            elif self.exchange == "coinbase":
+                if not self.coinbase_product_id:
+                    raise ValueError(f"Coinbase product id not resolved for {self.symbol_key}")
+                url = self._coinbase_url()
+                self.ws_app = websocket.WebSocketApp(
+                    url,
+                    on_message=self.on_message,
+                    on_error=self.on_error,
+                    on_close=self.on_close,
+                )
+                self.ws_app.on_open = self._coinbase_subscribe
+            else:
+                raise ValueError(f"Unsupported exchange: {self.exchange}")
+
             try:
                 self.ws_app.run_forever(ping_interval=20, ping_timeout=10)
             except Exception as exc:
+                if self.stop_event.is_set():
+                    break
                 print(f"[{self.symbol_key}] reconnecting websocket ({exc})")
                 time.sleep(2)
-            else:
+                continue
+
+            if self.stop_event.is_set():
                 break
+
+            print(f"[{self.symbol_key}] websocket disconnected, retrying in 2s")
+            time.sleep(2)
 
     def seed_history(self, records: List[Dict[str, Any]]) -> None:
         if not records:
@@ -707,6 +869,10 @@ class MonitorGUI:
                 if clipped:
                     self.records_by_symbol[key] = clipped
 
+        self.popular_pairs: Dict[str, List[str]] = {}
+        self.popular_pairs_timestamp: Optional[datetime] = None
+        self._reload_popular_pairs(initial=True)
+
         self.root = tk.Tk()
         self.preferred_font = preferred_font
         if preferred_font:
@@ -725,6 +891,7 @@ class MonitorGUI:
 
         self._build_widgets()
         self._setup_plot()
+        self._schedule_popular_pairs_refresh()
 
         if initial_history:
             for key, records in initial_history.items():
@@ -790,28 +957,34 @@ class MonitorGUI:
 
         selector_frame = ttk.Frame(metrics_frame)
         selector_frame.pack(fill=tk.X, pady=(0, 6))
-        self.exchange_filter_var = tk.StringVar(value="全部")
-        self.symbol_filter_var = tk.StringVar(value="全部")
+        self.exchange_filter_var = tk.StringVar(value=ALL_OPTION)
+        self.symbol_filter_var = tk.StringVar(value=ALL_OPTION)
         ttk.Label(selector_frame, text="交易所").grid(row=0, column=0, padx=(0, 4))
-        self.exchange_selector = ttk.Combobox(
+        self.exchange_selector = SearchableCombobox(
             selector_frame,
             textvariable=self.exchange_filter_var,
-            state="readonly",
             width=12,
         )
         self.exchange_selector.grid(row=0, column=1, padx=(0, 12))
         self.exchange_selector.bind("<<ComboboxSelected>>", lambda _: self._on_exchange_filter_change())
         ttk.Label(selector_frame, text="币对").grid(row=0, column=2, padx=(0, 4))
-        self.symbol_selector = ttk.Combobox(
+        self.symbol_selector = SearchableCombobox(
             selector_frame,
             textvariable=self.symbol_filter_var,
-            state="readonly",
             width=14,
         )
         self.symbol_selector.grid(row=0, column=3, padx=(0, 12))
         self.symbol_selector.bind("<<ComboboxSelected>>", lambda _: self._on_symbol_filter_change())
-        selector_frame.columnconfigure(4, weight=1)
-
+        ttk.Label(selector_frame, text="热门").grid(row=0, column=4, padx=(0, 4))
+        self.hot_pair_selector = SearchableCombobox(
+            selector_frame,
+            width=18,
+        )
+        self.hot_pair_selector.grid(row=0, column=5, padx=(0, 12))
+        self.hot_pair_selector.bind("<<ComboboxSelected>>", lambda _: self._on_hot_pair_selected())
+        self.hot_pairs_update_label.configure(text=f"热门更新: {dt_local.strftime('%Y-%m-%d %H:%M')}")
+        self.hot_pairs_update_label.grid(row=0, column=6, sticky="w")
+        selector_frame.columnconfigure(7, weight=1)
         container = ttk.Frame(metrics_frame)
         container.pack(fill=tk.X)
         self.metrics_container = container
@@ -857,7 +1030,7 @@ class MonitorGUI:
                 label_widgets[label_key] = lbl
 
             add_item(0, "Time", "时间", "time")
-            add_item(1, "Price", "价格", "mid")
+            add_item(1, "Price", f"价格 ({source.exchange.upper()})", "mid")
             add_item(2, "Delta", "净成交量", "delta")
             add_item(3, f"Δ Sum ({self.cfg.delta_window}s)", "Delta累积", "delta_sum")
             add_item(4, f"CVD ({self.cfg.cvd_window}s)", "累积Delta", "cvd")
@@ -872,13 +1045,33 @@ class MonitorGUI:
         chart_frame.pack(fill=tk.BOTH, expand=True, pady=6)
         self.chart_frame = chart_frame
 
+    def _reload_popular_pairs(self, initial: bool = False) -> None:
+        try:
+            pairs_map, fetched_at = coinpair.get_pairs_map(limit=50)
+        except Exception as exc:
+            prefix = "初始化" if initial else "定时"
+            print(f"[warn] {prefix}热门币对加载失败：{exc}")
+            return
+        self.popular_pairs = pairs_map
+        self.popular_pairs_timestamp = fetched_at
+        if hasattr(self, "hot_pair_selector"):
+            self._update_hot_pairs_options()
+
+    def _schedule_popular_pairs_refresh(self) -> None:
+        interval_seconds = max(3600, int(coinpair.CACHE_MAX_AGE.total_seconds()))
+        self.root.after(interval_seconds * 1000, self._refresh_popular_pairs_periodic)
+
+    def _refresh_popular_pairs_periodic(self) -> None:
+        self._reload_popular_pairs(initial=False)
+        self._schedule_popular_pairs_refresh()
+
     def _refresh_symbol_selector(self) -> None:
         keys = [source.normalized().display for source in self.cfg.symbol_sources]
         exchanges = sorted({key.split(":", 1)[0] for key in keys})
-        exchange_values = ["全部"] + exchanges
-        self.exchange_selector["values"] = exchange_values
+        exchange_values = [ALL_OPTION] + exchanges
+        self.exchange_selector.set_values(exchange_values)
         if self.exchange_filter_var.get() not in exchange_values:
-            self.exchange_filter_var.set(exchange_values[0] if exchange_values else "全部")
+            self.exchange_filter_var.set(exchange_values[0] if exchange_values else ALL_OPTION)
         self._update_symbol_options()
 
     def _on_exchange_filter_change(self) -> None:
@@ -887,16 +1080,24 @@ class MonitorGUI:
     def _update_symbol_options(self) -> None:
         exchange = self.exchange_filter_var.get()
         keys = list(self.symbol_frames.keys())
-        if exchange not in ("全部", "", None):
+        if exchange not in (ALL_OPTION, "", None):
             keys = [key for key in keys if key.split(":", 1)[0] == exchange]
         symbols = sorted({key.split(":", 1)[1] for key in keys})
-        symbol_values = ["全部"] + symbols
-        self.symbol_selector["values"] = symbol_values
+        symbol_values = [ALL_OPTION] + symbols
+        self.symbol_selector.set_values(symbol_values)
         if self.symbol_filter_var.get() not in symbol_values:
-            self.symbol_filter_var.set(symbol_values[0] if symbol_values else "全部")
+            self.symbol_filter_var.set(symbol_values[0] if symbol_values else ALL_OPTION)
         self._apply_symbol_filter()
+        self._update_hot_pairs_options()
 
     def _on_symbol_filter_change(self) -> None:
+        self._apply_symbol_filter()
+
+    def _on_hot_pair_selected(self) -> None:
+        value = self.hot_pair_selector.get()
+        if not value or value in (HOT_DEFAULT_OPTION, HOT_EMPTY_OPTION):
+            return
+        self.symbol_filter_var.set(value.upper())
         self._apply_symbol_filter()
 
     def _apply_symbol_filter(self) -> None:
@@ -906,9 +1107,9 @@ class MonitorGUI:
         filtered: List[str] = []
         for key in keys:
             key_exchange, key_symbol = key.split(":", 1)
-            if exchange not in ("全部", "", None) and key_exchange != exchange:
+            if exchange not in (ALL_OPTION, "", None) and key_exchange != exchange:
                 continue
-            if symbol not in ("全部", "", None) and key_symbol != symbol:
+            if symbol not in (ALL_OPTION, "", None) and key_symbol != symbol:
                 continue
             filtered.append(key)
         if not filtered:
@@ -926,6 +1127,29 @@ class MonitorGUI:
             if key not in filtered:
                 frame.grid_remove()
 
+    def _update_hot_pairs_options(self) -> None:
+        exchange = self.exchange_filter_var.get()
+        if exchange in (ALL_OPTION, "", None):
+            values = [HOT_EMPTY_OPTION]
+        else:
+            pairs = [symbol for symbol in self.popular_pairs.get(exchange.upper(), [])]
+            if exchange.upper() == 'COINBASE':
+                pairs = sorted(pairs)
+            values = [HOT_DEFAULT_OPTION] + pairs if pairs else [HOT_EMPTY_OPTION]
+        self.hot_pair_selector.set_values(values)
+        if values:
+            self.hot_pair_selector.set(values[0])
+            self.hot_pair_selector.icursor(tk.END)
+            self.hot_pair_selector.current(0)
+        self._update_hot_pairs_label()
+
+    def _update_hot_pairs_label(self) -> None:
+        if not self.popular_pairs_timestamp:
+            self.hot_pairs_update_label.configure(text="")
+            return
+        dt_local = self.popular_pairs_timestamp.astimezone(self.display_tz)
+        self.hot_pairs_update_label.configure(text=f"热门更新: {dt_local.strftime('%Y-%m-%d %H:%M')}")
+
     def _setup_plot(self) -> None:
         ncols = max(1, len(self.cfg.symbol_sources))
         figure = Figure(figsize=(11, 7.8), dpi=100)
@@ -937,27 +1161,38 @@ class MonitorGUI:
         time_formatter = mdates.DateFormatter("%H:%M:%S", tz=self.display_tz)
         for col, source in enumerate(self.cfg.symbol_sources):
             key = source.normalized().display
-    
+            if ':' in key:
+                exchange, symbol = key.split(':', 1)
+            else:
+                exchange, symbol = key, key
+            exchange_upper = exchange.upper()
+            symbol_upper = symbol.upper()
+            display_label = f"{exchange_upper} - {symbol_upper}"
+
             ax_price = figure.add_subplot(3, ncols, col + 1)
-            ax_price.set_title(f"{key} Price")
-            ax_price.set_ylabel("Price / 价格")
-            ax_price.grid(True, linestyle="--", alpha=0.3)
+            ax_price.set_title(f"{display_label} Price")
+            ax_price.set_ylabel(f"Price ({exchange_upper})")
+            ax_price.grid(True, linestyle='--', alpha=0.3)
             ax_price.xaxis.set_major_formatter(time_formatter)
             self.axes_price[key] = ax_price
-    
+
             ax_cvd = figure.add_subplot(3, ncols, ncols + col + 1)
-            ax_cvd.set_title(f"{key} CVD")
-            ax_cvd.set_ylabel("CVD")
-            ax_cvd.grid(True, linestyle="--", alpha=0.3)
+            ax_cvd.set_title(f"{display_label} CVD")
+            ax_cvd.set_ylabel('CVD')
+            ax_cvd.grid(True, linestyle='--', alpha=0.3)
             ax_cvd.xaxis.set_major_formatter(time_formatter)
             self.axes_cvd[key] = ax_cvd
-    
+
             ax_imbal = figure.add_subplot(3, ncols, 2 * ncols + col + 1)
-            ax_imbal.set_title(f"{key} OB Imbalance")
-            ax_imbal.set_ylabel("盘口不平衡")
+            ax_imbal.set_title(f"{display_label} OB Imbalance")
+            ax_imbal.set_ylabel('盘口不平衡')
             ax_imbal.set_ylim(-1, 1)
-            ax_imbal.grid(True, linestyle="--", alpha=0.3)
+            ax_imbal.grid(True, linestyle='--', alpha=0.3)
             ax_imbal.xaxis.set_major_formatter(time_formatter)
+            self.axes_imbalance[key] = ax_imbal
+            ax_imbal.xaxis.set_major_formatter(time_formatter)
+            self.axes_imbalance[key] = ax_imbal
+            ax_imbal.set_ylabel("盘口不平衡")
             self.axes_imbalance[key] = ax_imbal
     
         self.canvas = FigureCanvasTkAgg(figure, master=self.chart_frame)
@@ -1126,7 +1361,13 @@ class MonitorGUI:
         records = self.records_by_symbol.get(symbol_key, [])
         if not records:
             return
-    
+
+        if ":" in symbol_key:
+            exchange, _symbol = symbol_key.split(":", 1)
+        else:
+            exchange, _symbol = symbol_key, symbol_key
+        exchange_upper = exchange.upper()
+
         times = [self._to_display_timestamp(r['timestamp']) for r in records]
         price = [float(r.get('mid', float('nan'))) for r in records]
         cvd = [float(r.get('cvd', 0.0) or 0.0) for r in records]
@@ -1148,7 +1389,7 @@ class MonitorGUI:
         ax_imbal.clear()
     
         ax_price.plot(times, price, color='#1976d2', label='Price')
-        ax_price.set_ylabel('Price / 价格')
+        ax_price.set_ylabel(f'Price ({exchange_upper})')
         ax_price.grid(True, linestyle='--', alpha=0.3)
         ax_price.xaxis.set_major_formatter(self.time_formatter)
         ax_price.tick_params(axis='x', rotation=20)

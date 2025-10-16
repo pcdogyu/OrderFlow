@@ -19,6 +19,6 @@ DEFAULT_HISTORY_SECONDS = 3600
 DEFAULT_IMBALANCE_SMOOTH_POINTS = 5
 
 DEFAULT_SYMBOLS = [
-    "binanceus:btcusdt",
     "coinbase:btc-usd",
+    "okx:btc-usdt",
 ]
