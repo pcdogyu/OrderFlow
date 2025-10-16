@@ -103,9 +103,9 @@ class MonitorConfig:
 
 
 
-ALL_OPTION = ALL_OPTION
-HOT_DEFAULT_OPTION = HOT_DEFAULT_OPTION
-HOT_EMPTY_OPTION = HOT_EMPTY_OPTION
+ALL_OPTION = "全部"
+HOT_DEFAULT_OPTION = "热门推荐"
+HOT_EMPTY_OPTION = "暂无热门"
 
 class SearchableCombobox(ttk.Combobox):
     def __init__(self, master=None, *, values=None, **kwargs):
@@ -982,7 +982,7 @@ class MonitorGUI:
         )
         self.hot_pair_selector.grid(row=0, column=5, padx=(0, 12))
         self.hot_pair_selector.bind("<<ComboboxSelected>>", lambda _: self._on_hot_pair_selected())
-        self.hot_pairs_update_label.configure(text=f"热门更新: {dt_local.strftime('%Y-%m-%d %H:%M')}")
+        self.hot_pairs_update_label = ttk.Label(selector_frame, text="")
         self.hot_pairs_update_label.grid(row=0, column=6, sticky="w")
         selector_frame.columnconfigure(7, weight=1)
         container = ttk.Frame(metrics_frame)
