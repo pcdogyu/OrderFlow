@@ -26,23 +26,30 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import queue
 import signal
 import threading
 import time
 from datetime import datetime
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 DISPLAY_TZ = ZoneInfo("Asia/Shanghai")
 UTC_TZ = ZoneInfo("UTC")
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
+from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
 import websocket
 
 import coinpair
+
+try:
+    import requests
+except ImportError:  # pragma: no cover - optional dependency
+    requests = None  # type: ignore
 
 import tkinter as tk
 import tkinter.font as tkfont
@@ -81,8 +88,8 @@ class SymbolSource:
 class MonitorConfig:
     symbol_sources: List[SymbolSource] = field(
         default_factory=lambda: [
-            SymbolSource("coinbase", "btc-usd"),
-            SymbolSource("okx", "btc-usdt"),
+            SymbolSource("coinbase", "btcusdt"),
+            SymbolSource("coinbase", "ethusdt"),
         ]
     )
     poll_interval: float = 0.5  # seconds
@@ -91,6 +98,8 @@ class MonitorConfig:
     cvd_window: int = 60
     imbalance_smooth_points: int = 5
     divergence_window: int = 300
+    startup_backfill_seconds: int = 900
+    history_cache_path: Optional[str] = None
     price_tolerance: float = 0.0005
     cvd_tolerance: float = 0.25
     influx_url: Optional[str] = None
@@ -104,7 +113,6 @@ class MonitorConfig:
 
 
 ALL_OPTION = "全部"
-HOT_DEFAULT_OPTION = "热门推荐"
 HOT_EMPTY_OPTION = "暂无热门"
 
 class SearchableCombobox(ttk.Combobox):
@@ -228,6 +236,387 @@ def clip_records_to_window(
     return filtered
 
 
+def _safe_float(value: Any) -> Optional[float]:
+    try:
+        if value is None:
+            return None
+        result = float(value)
+        if math.isfinite(result):
+            return result
+    except (TypeError, ValueError):
+        return None
+    return None
+
+
+class HistoryCache:
+    """JSON-backed cache for recent aggregate records per symbol."""
+
+    def __init__(self, path: Optional[str], max_seconds: int) -> None:
+        self.max_seconds = max(60, int(max_seconds))
+        self.lock = threading.Lock()
+        self._data: Dict[str, List[Dict[str, Any]]] = {}
+        self._loaded = False
+        self.enabled = True
+
+        if path is not None and not path.strip():
+            self.enabled = False
+            self.path: Optional[Path] = None
+            return
+
+        if path is None:
+            default_dir = Path(__file__).resolve().parent / "output"
+            default_dir.mkdir(parents=True, exist_ok=True)
+            self.path = default_dir / "history_cache.json"
+        else:
+            candidate = Path(path).expanduser()
+            if not candidate.is_absolute():
+                candidate = (Path(__file__).resolve().parent / candidate).resolve()
+            candidate.parent.mkdir(parents=True, exist_ok=True)
+            self.path = candidate
+
+    def _ensure_loaded(self) -> None:
+        if not self.enabled or self._loaded or self.path is None:
+            return
+        with self.lock:
+            if self._loaded:
+                return
+            try:
+                if self.path.exists():
+                    raw = json.loads(self.path.read_text(encoding="utf-8"))
+                    if isinstance(raw, dict):
+                        self._data = {
+                            key: value
+                            for key, value in raw.items()
+                            if isinstance(key, str) and isinstance(value, list)
+                        }
+            except Exception as exc:
+                print(f"[warn] failed to load history cache {self.path}: {exc}")
+                self._data = {}
+            finally:
+                self._loaded = True
+
+    def load_for_key(self, key: str) -> List[Dict[str, Any]]:
+        if not self.enabled or self.path is None:
+            return []
+        self._ensure_loaded()
+        with self.lock:
+            raw_items = list(self._data.get(key, []))
+        if not raw_items:
+            return []
+        cutoff = pd.Timestamp.utcnow().tz_localize(None) - pd.Timedelta(seconds=self.max_seconds)
+        restored: List[Dict[str, Any]] = []
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
+            ts_raw = item.get("timestamp")
+            if not ts_raw:
+                continue
+            try:
+                ts = pd.Timestamp(ts_raw)
+            except Exception:
+                continue
+            if ts.tzinfo is not None:
+                ts = ts.tz_convert(None)
+            if ts < cutoff:
+                continue
+            record = {
+                "timestamp": ts,
+                "mid": _safe_float(item.get("mid")) or float("nan"),
+                "delta": _safe_float(item.get("delta")) or 0.0,
+                "delta_sum": _safe_float(item.get("delta_sum")) or 0.0,
+                "cvd": _safe_float(item.get("cvd")) or 0.0,
+                "ob_imbalance": _safe_float(item.get("ob_imbalance")) or 0.0,
+                "buy_vol": _safe_float(item.get("buy_vol")) or 0.0,
+                "sell_vol": _safe_float(item.get("sell_vol")) or 0.0,
+            }
+            restored.append(record)
+        restored.sort(key=lambda r: r["timestamp"])
+        return restored
+
+    def load_all(self, sources: Iterable[SymbolSource]) -> Dict[str, List[Dict[str, Any]]]:
+        loaded: Dict[str, List[Dict[str, Any]]] = {}
+        for source in sources:
+            key = source.normalized().display
+            records = self.load_for_key(key)
+            if records:
+                loaded[key] = records
+        return loaded
+
+    def save_records(self, key: str, records: Iterable[Dict[str, Any]]) -> None:
+        if not self.enabled or self.path is None:
+            return
+        sanitized: List[Dict[str, Any]] = []
+        cutoff = pd.Timestamp.utcnow().tz_localize(None) - pd.Timedelta(seconds=self.max_seconds)
+        for rec in records:
+            try:
+                ts = pd.Timestamp(rec["timestamp"])
+            except Exception:
+                continue
+            if ts.tzinfo is not None:
+                ts = ts.tz_convert(None)
+            if ts < cutoff:
+                continue
+            entry = {
+                "timestamp": ts.isoformat(),
+                "mid": _safe_float(rec.get("mid")),
+                "delta": _safe_float(rec.get("delta")) or 0.0,
+                "delta_sum": _safe_float(rec.get("delta_sum")) or 0.0,
+                "cvd": _safe_float(rec.get("cvd")) or 0.0,
+                "ob_imbalance": _safe_float(rec.get("ob_imbalance")) or 0.0,
+                "buy_vol": _safe_float(rec.get("buy_vol")) or 0.0,
+                "sell_vol": _safe_float(rec.get("sell_vol")) or 0.0,
+            }
+            sanitized.append(entry)
+        if not sanitized:
+            return
+        max_items = 5000
+        if len(sanitized) > max_items:
+            sanitized = sanitized[-max_items:]
+        self._ensure_loaded()
+        with self.lock:
+            self._data[key] = sanitized
+            try:
+                payload = json.dumps(self._data, ensure_ascii=False, indent=2)
+                self.path.write_text(payload, encoding="utf-8")
+            except Exception as exc:
+                print(f"[warn] failed to persist history cache {self.path}: {exc}")
+
+    def flush(self) -> None:
+        # No-op: writes happen eagerly inside save_records.
+        return
+
+
+REST_TIMEOUT = 10
+
+
+def _build_records_from_trades(
+    trades: List[Dict[str, Any]],
+    cfg: MonitorConfig,
+    seconds: int,
+    ob_mid: Optional[float],
+    ob_imbalance: Optional[float],
+    source: SymbolSource,
+) -> List[Dict[str, Any]]:
+    if not trades:
+        return []
+    trades_sorted = sorted(trades, key=lambda item: item["timestamp"])
+    bucket_seconds = 1
+    bucket_freq = f"{bucket_seconds}S"
+    buckets: Dict[pd.Timestamp, Dict[str, Any]] = {}
+    for trade in trades_sorted:
+        ts = trade["timestamp"]
+        bucket_ts = ts.floor(bucket_freq)
+        bucket = buckets.setdefault(
+            bucket_ts,
+            {
+                "timestamp": bucket_ts,
+                "mid": float("nan"),
+                "delta": 0.0,
+                "delta_sum": 0.0,
+                "cvd": 0.0,
+                "ob_imbalance": ob_imbalance or 0.0,
+                "buy_vol": 0.0,
+                "sell_vol": 0.0,
+            },
+        )
+        price = trade["price"]
+        size = trade["size"]
+        side = trade["side"]
+        bucket["mid"] = price
+        if side >= 0:
+            bucket["buy_vol"] += size
+        else:
+            bucket["sell_vol"] += size
+        bucket["delta"] += side * size
+    cutoff = trades_sorted[-1]["timestamp"] - pd.Timedelta(seconds=seconds)
+    delta_window = max(1, int(cfg.delta_window))
+    delta_queue: Deque[Tuple[pd.Timestamp, float]] = deque()
+    delta_sum = 0.0
+    cvd = 0.0
+    records: List[Dict[str, Any]] = []
+    for ts in sorted(buckets.keys()):
+        if ts < cutoff:
+            continue
+        entry = buckets[ts]
+        mid_val = entry["mid"]
+        if (
+            not isinstance(mid_val, (int, float))
+            or (isinstance(mid_val, float) and math.isnan(mid_val))
+        ) and ob_mid is not None:
+            entry["mid"] = ob_mid
+        delta = entry["delta"]
+        cvd += delta
+        entry["cvd"] = cvd
+        delta_queue.append((ts, delta))
+        delta_sum += delta
+        cutoff_ts = ts - pd.Timedelta(seconds=delta_window)
+        while delta_queue and delta_queue[0][0] < cutoff_ts:
+            _, old = delta_queue.popleft()
+            delta_sum -= old
+        entry["delta_sum"] = delta_sum
+        entry["timestamp"] = ts
+        entry["exchange"] = source.exchange.upper()
+        entry["symbol"] = source.symbol.upper()
+        records.append(entry)
+    if not records and ob_mid is not None:
+        now = pd.Timestamp.utcnow().tz_localize(None)
+        records.append(
+            {
+                "timestamp": now,
+                "mid": ob_mid,
+                "delta": 0.0,
+                "delta_sum": 0.0,
+                "cvd": 0.0,
+                "ob_imbalance": ob_imbalance or 0.0,
+                "buy_vol": 0.0,
+                "sell_vol": 0.0,
+                "exchange": source.exchange.upper(),
+                "symbol": source.symbol.upper(),
+            }
+        )
+    return records[-2000:]
+
+
+def _fetch_binance_rest_history(source: SymbolSource, seconds: int, cfg: MonitorConfig) -> List[Dict[str, Any]]:
+    if requests is None:
+        return []
+    symbol = source.symbol.upper().replace("-", "")
+    end_ms = int(pd.Timestamp.utcnow().timestamp() * 1000)
+    start_ms = end_ms - seconds * 1000
+    trades: List[Dict[str, Any]] = []
+    params = {"symbol": symbol, "startTime": start_ms, "endTime": end_ms, "limit": 1000}
+    while True:
+        resp = requests.get("https://api.binance.us/api/v3/aggTrades", params=params, timeout=REST_TIMEOUT)
+        resp.raise_for_status()
+        payload = resp.json()
+        if not isinstance(payload, list) or not payload:
+            break
+        trades.extend(payload)
+        last_time = int(payload[-1]["T"])
+        if last_time >= end_ms or last_time <= params["startTime"]:
+            break
+        params["startTime"] = last_time + 1
+        if len(trades) >= 5000:
+            break
+    normalized: List[Dict[str, Any]] = []
+    cutoff = pd.Timestamp.utcnow().tz_localize(None) - pd.Timedelta(seconds=seconds)
+    for item in trades:
+        try:
+            ts = pd.Timestamp(item["T"], unit="ms").tz_localize(None)
+        except Exception:
+            continue
+        if ts < cutoff:
+            continue
+        price = _safe_float(item.get("p"))
+        qty = _safe_float(item.get("q"))
+        if price is None or qty is None:
+            continue
+        side = -1 if item.get("m") else 1
+        normalized.append({"timestamp": ts, "price": price, "size": qty, "side": side})
+    ob_mid = None
+    ob_imbalance = 0.0
+    try:
+        ob_resp = requests.get(
+            "https://api.binance.us/api/v3/ticker/bookTicker", params={"symbol": symbol}, timeout=REST_TIMEOUT
+        )
+        ob_resp.raise_for_status()
+        book = ob_resp.json()
+        bid = _safe_float(book.get("bidPrice"))
+        ask = _safe_float(book.get("askPrice"))
+        bid_qty = _safe_float(book.get("bidQty")) or 0.0
+        ask_qty = _safe_float(book.get("askQty")) or 0.0
+        if bid is not None and ask is not None:
+            ob_mid = (bid + ask) / 2
+        denom = bid_qty + ask_qty
+        if denom > 0:
+            ob_imbalance = (bid_qty - ask_qty) / denom
+    except Exception:
+        pass
+    return _build_records_from_trades(normalized, cfg, seconds, ob_mid, ob_imbalance, source)
+
+
+def _fetch_coinbase_rest_history(source: SymbolSource, seconds: int, cfg: MonitorConfig) -> List[Dict[str, Any]]:
+    if requests is None:
+        return []
+    product_id = source.symbol.upper()
+    cutoff = pd.Timestamp.utcnow().tz_localize(None) - pd.Timedelta(seconds=seconds)
+    trades: List[Dict[str, Any]] = []
+    params: Dict[str, Any] = {"limit": 100}
+    attempts = 0
+    reached_cutoff = False
+    while attempts < 50 and not reached_cutoff:
+        attempts += 1
+        resp = requests.get(
+            f"https://api.exchange.coinbase.com/products/{product_id}/trades", params=params, timeout=REST_TIMEOUT
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        if not isinstance(payload, list) or not payload:
+            break
+        for trade in payload:
+            ts_raw = trade.get("time")
+            if not ts_raw:
+                continue
+            try:
+                ts = pd.Timestamp(ts_raw).tz_convert(None)
+            except Exception:
+                continue
+            if ts < cutoff:
+                reached_cutoff = True
+                break
+            price = _safe_float(trade.get("price"))
+            size = _safe_float(trade.get("size"))
+            if price is None or size is None:
+                continue
+            side_flag = str(trade.get("side") or "").lower()
+            side = 1 if side_flag == "buy" else -1
+            trades.append({"timestamp": ts, "price": price, "size": size, "side": side})
+        if reached_cutoff:
+            break
+        last_trade = payload[-1]
+        trade_id = last_trade.get("trade_id")
+        if trade_id is None:
+            break
+        params["after"] = trade_id
+    ob_mid = None
+    ob_imbalance = 0.0
+    try:
+        ob_resp = requests.get(
+            f"https://api.exchange.coinbase.com/products/{product_id}/book", params={"level": 1}, timeout=REST_TIMEOUT
+        )
+        ob_resp.raise_for_status()
+        book = ob_resp.json()
+        bids = book.get("bids") or []
+        asks = book.get("asks") or []
+        bid = _safe_float(bids[0][0]) if bids and isinstance(bids[0], (list, tuple)) else None
+        ask = _safe_float(asks[0][0]) if asks and isinstance(asks[0], (list, tuple)) else None
+        bid_qty = _safe_float(bids[0][1]) if bids and isinstance(bids[0], (list, tuple)) else 0.0
+        ask_qty = _safe_float(asks[0][1]) if asks and isinstance(asks[0], (list, tuple)) else 0.0
+        if bid is not None and ask is not None:
+            ob_mid = (bid + ask) / 2
+        denom = bid_qty + ask_qty
+        if denom > 0:
+            ob_imbalance = (bid_qty - ask_qty) / denom
+    except Exception:
+        pass
+    return _build_records_from_trades(trades, cfg, seconds, ob_mid, ob_imbalance, source)
+
+
+def fetch_rest_history(source: SymbolSource, cfg: MonitorConfig) -> List[Dict[str, Any]]:
+    normalized = source.normalized()
+    seconds = min(max(60, cfg.startup_backfill_seconds), cfg.history_seconds)
+    if seconds <= 0:
+        return []
+    try:
+        if normalized.exchange in {"binanceus", "binance"}:
+            return _fetch_binance_rest_history(normalized, seconds, cfg)
+        if normalized.exchange == "coinbase":
+            return _fetch_coinbase_rest_history(normalized, seconds, cfg)
+    except Exception as exc:
+        print(f"[warn] REST backfill failed for {normalized.display}: {exc}")
+    return []
+
+
 class InfluxPublisher:
     """Thin wrapper around influxdb-client to handle concurrent writes."""
 
@@ -347,6 +736,7 @@ class OrderFlowMonitor:
         config: MonitorConfig,
         record_queue: "queue.Queue[Tuple[str, Dict[str, Any]]]",
         publisher: Optional[InfluxPublisher] = None,
+        history_cache: Optional[HistoryCache] = None,
     ) -> None:
         normalized = source.normalized()
         self.source = normalized
@@ -358,6 +748,7 @@ class OrderFlowMonitor:
         self.cfg = config
         self.record_queue = record_queue
         self.publisher = publisher
+        self.history_cache = history_cache
 
         self.coinbase_product_id: Optional[str] = None
         if self.exchange == "coinbase":
@@ -386,6 +777,8 @@ class OrderFlowMonitor:
         self.ws_app: Optional[websocket.WebSocketApp] = None
         self.stop_event = threading.Event()
         self.lock = threading.Lock()
+        self._backfill_done = False
+        self._last_cache_flush = 0.0
 
     @staticmethod
     def _ensure_naive(ts: Any) -> pd.Timestamp:
@@ -707,6 +1100,9 @@ class OrderFlowMonitor:
             if ts >= cutoff_cvd:
                 self.cvd_window_values.append((ts, delta_val))
                 self.cvd_value += delta_val
+        if self.stats:
+            self._backfill_done = True
+            self._persist_history_snapshot(force=True)
 
     def _update_window(
         self,
@@ -723,6 +1119,51 @@ class OrderFlowMonitor:
             _, old_value = buffer.popleft()
             current_sum -= old_value
         return current_sum
+
+    def _ensure_startup_backfill(self, record: Dict[str, Any]) -> None:
+        if self._backfill_done or self.stats:
+            return
+        seconds = min(max(60, self.cfg.startup_backfill_seconds), self.cfg.history_seconds)
+        if seconds <= 0:
+            self._backfill_done = True
+            return
+        now_ts = self._ensure_naive(record["timestamp"])
+        start_ts = now_ts - pd.Timedelta(seconds=seconds)
+        step_seconds = max(1.0, self.cfg.poll_interval)
+        step_delta = pd.Timedelta(seconds=step_seconds)
+        template_mid = _safe_float(record.get("mid"))
+        template_ob = _safe_float(record.get("ob_imbalance")) or 0.0
+        backfill: List[Dict[str, Any]] = []
+        ts_cursor = start_ts
+        while ts_cursor < now_ts:
+            backfill.append(
+                {
+                    "timestamp": ts_cursor,
+                    "mid": template_mid if template_mid is not None else float("nan"),
+                    "delta": 0.0,
+                    "delta_sum": 0.0,
+                    "cvd": 0.0,
+                    "ob_imbalance": float(template_ob),
+                    "buy_vol": 0.0,
+                    "sell_vol": 0.0,
+                }
+            )
+            ts_cursor += step_delta
+        if backfill:
+            self.seed_history(backfill)
+        self._backfill_done = True
+
+    def _persist_history_snapshot(self, force: bool = False) -> None:
+        if self.history_cache is None or not self.stats:
+            return
+        now_time = time.time()
+        if not force and now_time - self._last_cache_flush < 5.0:
+            return
+        self._last_cache_flush = now_time
+        try:
+            self.history_cache.save_records(self.symbol_key, list(self.stats))
+        except Exception as exc:
+            print(f"[warn] failed to cache history for {self.symbol_key}: {exc}")
 
     def detect_divergence(self) -> str:
         if len(self.stats) < 3:
@@ -795,6 +1236,8 @@ class OrderFlowMonitor:
             "buy_vol": buy_vol,
             "sell_vol": sell_vol,
         }
+        if not self.stats:
+            self._ensure_startup_backfill(record)
         self.stats.append(record)
         while self.stats and (
             now - self._ensure_naive(self.stats[0]["timestamp"])
@@ -820,6 +1263,7 @@ class OrderFlowMonitor:
             except queue.Empty:
                 pass
             self.record_queue.put_nowait((self.symbol_key, record))
+        self._persist_history_snapshot()
         return record
 
     def run_aggregation_loop(self) -> None:
@@ -842,6 +1286,7 @@ class OrderFlowMonitor:
                 self.ws_app.close()
             except Exception:
                 pass
+        self._persist_history_snapshot(force=True)
 class MonitorGUI:
     """Tkinter GUI handling multi-symbol layout."""
 
@@ -856,6 +1301,7 @@ class MonitorGUI:
         self.cfg = cfg
         self.record_queue = record_queue
         self.stop_callback = stop_callback
+        self._is_closing = False
 
         self.display_tz = DISPLAY_TZ
         self.utc_tz = UTC_TZ
@@ -871,6 +1317,8 @@ class MonitorGUI:
 
         self.popular_pairs: Dict[str, List[str]] = {}
         self.popular_pairs_timestamp: Optional[datetime] = None
+        self.selected_pair_key: Optional[str] = None
+        self.pair_choice_map: Dict[str, str] = {}
         self._reload_popular_pairs(initial=True)
 
         self.root = tk.Tk()
@@ -957,34 +1405,21 @@ class MonitorGUI:
 
         selector_frame = ttk.Frame(metrics_frame)
         selector_frame.pack(fill=tk.X, pady=(0, 6))
-        self.exchange_filter_var = tk.StringVar(value=ALL_OPTION)
         self.symbol_filter_var = tk.StringVar(value=ALL_OPTION)
-        ttk.Label(selector_frame, text="交易所").grid(row=0, column=0, padx=(0, 4))
-        self.exchange_selector = SearchableCombobox(
-            selector_frame,
-            textvariable=self.exchange_filter_var,
-            width=12,
-        )
-        self.exchange_selector.grid(row=0, column=1, padx=(0, 12))
-        self.exchange_selector.bind("<<ComboboxSelected>>", lambda _: self._on_exchange_filter_change())
-        ttk.Label(selector_frame, text="币对").grid(row=0, column=2, padx=(0, 4))
-        self.symbol_selector = SearchableCombobox(
+        ttk.Label(selector_frame, text="币对").grid(row=0, column=0, padx=(0, 4))
+        pair_choices = self._build_pair_choices()
+        self.pair_selector = SearchableCombobox(
             selector_frame,
             textvariable=self.symbol_filter_var,
-            width=14,
+            values=pair_choices,
+            width=28,
         )
-        self.symbol_selector.grid(row=0, column=3, padx=(0, 12))
-        self.symbol_selector.bind("<<ComboboxSelected>>", lambda _: self._on_symbol_filter_change())
-        ttk.Label(selector_frame, text="热门").grid(row=0, column=4, padx=(0, 4))
-        self.hot_pair_selector = SearchableCombobox(
-            selector_frame,
-            width=18,
-        )
-        self.hot_pair_selector.grid(row=0, column=5, padx=(0, 12))
-        self.hot_pair_selector.bind("<<ComboboxSelected>>", lambda _: self._on_hot_pair_selected())
+        self.pair_selector.grid(row=0, column=1, padx=(0, 12))
+        self.pair_selector.bind("<<ComboboxSelected>>", lambda _: self._on_pair_selected())
+        ttk.Label(selector_frame, text="热门更新:").grid(row=0, column=2, padx=(0, 4))
         self.hot_pairs_update_label = ttk.Label(selector_frame, text="")
-        self.hot_pairs_update_label.grid(row=0, column=6, sticky="w")
-        selector_frame.columnconfigure(7, weight=1)
+        self.hot_pairs_update_label.grid(row=0, column=3, sticky="w")
+        selector_frame.columnconfigure(4, weight=1)
         container = ttk.Frame(metrics_frame)
         container.pack(fill=tk.X)
         self.metrics_container = container
@@ -996,7 +1431,8 @@ class MonitorGUI:
 
         for idx, source in enumerate(self.cfg.symbol_sources):
             key = source.normalized().display
-            block = ttk.LabelFrame(container, text=key, padding="4")
+            display_symbol = self._extract_display_parts(key)[1]
+            block = ttk.LabelFrame(container, text=display_symbol, padding="4")
             block.grid(row=0, column=idx, sticky="nsew", padx=4, pady=2)
             self.symbol_frames[key] = block
 
@@ -1029,8 +1465,12 @@ class MonitorGUI:
                 lbl.pack(anchor=tk.W)
                 label_widgets[label_key] = lbl
 
+                if label_key == "cvd":
+                    heading.configure(foreground="#000000")
+                    lbl.configure(fg="#000000")
+
             add_item(0, "Time", "时间", "time")
-            add_item(1, "Price", f"价格 ({source.exchange.upper()})", "mid")
+            add_item(1, "Price", "价格", "mid")
             add_item(2, "Delta", "净成交量", "delta")
             add_item(3, f"Δ Sum ({self.cfg.delta_window}s)", "Delta累积", "delta_sum")
             add_item(4, f"CVD ({self.cfg.cvd_window}s)", "累积Delta", "cvd")
@@ -1039,7 +1479,7 @@ class MonitorGUI:
 
             self.metric_widgets[key] = label_widgets
 
-        self._refresh_symbol_selector()
+        self._update_pair_selector()
 
         chart_frame = ttk.LabelFrame(mainframe, text="15分钟滚动图 Realtime Charts", padding="6")
         chart_frame.pack(fill=tk.BOTH, expand=True, pady=6)
@@ -1054,8 +1494,9 @@ class MonitorGUI:
             return
         self.popular_pairs = pairs_map
         self.popular_pairs_timestamp = fetched_at
-        if hasattr(self, "hot_pair_selector"):
-            self._update_hot_pairs_options()
+        if hasattr(self, "pair_selector"):
+            self._update_pair_selector()
+            self._update_hot_pairs_label()
 
     def _schedule_popular_pairs_refresh(self) -> None:
         interval_seconds = max(3600, int(coinpair.CACHE_MAX_AGE.total_seconds()))
@@ -1065,53 +1506,58 @@ class MonitorGUI:
         self._reload_popular_pairs(initial=False)
         self._schedule_popular_pairs_refresh()
 
-    def _refresh_symbol_selector(self) -> None:
-        keys = [source.normalized().display for source in self.cfg.symbol_sources]
-        exchanges = sorted({key.split(":", 1)[0] for key in keys})
-        exchange_values = [ALL_OPTION] + exchanges
-        self.exchange_selector.set_values(exchange_values)
-        if self.exchange_filter_var.get() not in exchange_values:
-            self.exchange_filter_var.set(exchange_values[0] if exchange_values else ALL_OPTION)
-        self._update_symbol_options()
+    @staticmethod
+    def _extract_display_parts(key: str) -> tuple[str, str]:
+        if ':' in key:
+            exchange, symbol = key.split(':', 1)
+        else:
+            exchange, symbol = '', key
+        return exchange.upper(), symbol.replace('-', '').upper()
 
-    def _on_exchange_filter_change(self) -> None:
-        self._update_symbol_options()
+    def _build_pair_choices(self) -> list[str]:
+        choice_map: dict[str, str] = {}
+        choices: list[str] = [ALL_OPTION]
+        for key in sorted(self.records_by_symbol.keys()):
+            _, symbol_display = self._extract_display_parts(key)
+            if symbol_display not in choice_map:
+                choice_map[symbol_display] = key
+                choices.append(symbol_display)
+        hot_pairs = sorted(self.popular_pairs.get('COINBASE', []))
+        for symbol in hot_pairs:
+            symbol_display = symbol.replace('-', '').upper()
+            if symbol_display in choice_map:
+                continue
+            choice_map[symbol_display] = f"COINBASE:{symbol.upper()}"
+            choices.append(symbol_display)
+        self.pair_choice_map = choice_map
+        return choices
 
-    def _update_symbol_options(self) -> None:
-        exchange = self.exchange_filter_var.get()
-        keys = list(self.symbol_frames.keys())
-        if exchange not in (ALL_OPTION, "", None):
-            keys = [key for key in keys if key.split(":", 1)[0] == exchange]
-        symbols = sorted({key.split(":", 1)[1] for key in keys})
-        symbol_values = [ALL_OPTION] + symbols
-        self.symbol_selector.set_values(symbol_values)
-        if self.symbol_filter_var.get() not in symbol_values:
-            self.symbol_filter_var.set(symbol_values[0] if symbol_values else ALL_OPTION)
+    def _update_pair_selector(self) -> None:
+        choices = self._build_pair_choices()
+        self.pair_selector.set_values(choices)
+        display = self.symbol_filter_var.get()
+        if display not in choices:
+            display = ALL_OPTION
+        self.symbol_filter_var.set(display)
+        self.selected_pair_key = None if display == ALL_OPTION else self.pair_choice_map.get(display)
+        self.pair_selector.set(display)
         self._apply_symbol_filter()
-        self._update_hot_pairs_options()
 
-    def _on_symbol_filter_change(self) -> None:
-        self._apply_symbol_filter()
-
-    def _on_hot_pair_selected(self) -> None:
-        value = self.hot_pair_selector.get()
-        if not value or value in (HOT_DEFAULT_OPTION, HOT_EMPTY_OPTION):
-            return
-        self.symbol_filter_var.set(value.upper())
+    def _on_pair_selected(self) -> None:
+        display = self.symbol_filter_var.get()
+        if display == ALL_OPTION:
+            self.selected_pair_key = None
+        else:
+            self.selected_pair_key = self.pair_choice_map.get(display)
         self._apply_symbol_filter()
 
     def _apply_symbol_filter(self) -> None:
-        exchange = self.exchange_filter_var.get()
-        symbol = self.symbol_filter_var.get()
+        target = getattr(self, "selected_pair_key", None)
         keys = list(self.symbol_frames.keys())
-        filtered: List[str] = []
-        for key in keys:
-            key_exchange, key_symbol = key.split(":", 1)
-            if exchange not in (ALL_OPTION, "", None) and key_exchange != exchange:
-                continue
-            if symbol not in (ALL_OPTION, "", None) and key_symbol != symbol:
-                continue
-            filtered.append(key)
+        if target:
+            filtered = [key for key in keys if key == target]
+        else:
+            filtered = keys[:]
         if not filtered:
             filtered = keys
 
@@ -1127,21 +1573,39 @@ class MonitorGUI:
             if key not in filtered:
                 frame.grid_remove()
 
-    def _update_hot_pairs_options(self) -> None:
-        exchange = self.exchange_filter_var.get()
-        if exchange in (ALL_OPTION, "", None):
-            values = [HOT_EMPTY_OPTION]
-        else:
-            pairs = [symbol for symbol in self.popular_pairs.get(exchange.upper(), [])]
-            if exchange.upper() == 'COINBASE':
-                pairs = sorted(pairs)
-            values = [HOT_DEFAULT_OPTION] + pairs if pairs else [HOT_EMPTY_OPTION]
-        self.hot_pair_selector.set_values(values)
-        if values:
-            self.hot_pair_selector.set(values[0])
-            self.hot_pair_selector.icursor(tk.END)
-            self.hot_pair_selector.current(0)
-        self._update_hot_pairs_label()
+        self._update_chart_visibility()
+
+    def _update_chart_visibility(self) -> None:
+        if not hasattr(self, "axes_price") or not hasattr(self, "canvas"):
+            return
+
+        target = getattr(self, "selected_pair_key", None)
+        axes_keys = list(self.axes_price.keys())
+        if target not in axes_keys:
+            target = None
+
+        for key in axes_keys:
+            visible = target is None or key == target
+            ax_price = self.axes_price[key]
+            ax_cvd = self.axes_cvd[key]
+            ax_imbal = self.axes_imbalance[key]
+
+            for ax in (ax_price, ax_cvd):
+                ax.set_visible(visible)
+                ax.get_xaxis().set_visible(visible)
+                ax.get_yaxis().set_visible(visible)
+                ax.patch.set_visible(visible)
+                for spine in ax.spines.values():
+                    spine.set_visible(visible)
+
+            ax_imbal.set_visible(visible)
+            ax_imbal.get_xaxis().set_visible(visible)
+            ax_imbal.get_yaxis().set_visible(visible)
+            ax_imbal.patch.set_visible(visible)
+            for spine in ax_imbal.spines.values():
+                spine.set_visible(visible)
+
+        self.canvas.draw_idle()
 
     def _update_hot_pairs_label(self) -> None:
         if not self.popular_pairs_timestamp:
@@ -1152,54 +1616,57 @@ class MonitorGUI:
 
     def _setup_plot(self) -> None:
         ncols = max(1, len(self.cfg.symbol_sources))
-        figure = Figure(figsize=(11, 7.8), dpi=100)
+        figure = Figure(figsize=(11, 9.5), dpi=100)
         self.figure = figure
         self.axes_price: Dict[str, Any] = {}
         self.axes_cvd: Dict[str, Any] = {}
         self.axes_imbalance: Dict[str, Any] = {}
-    
+
         time_formatter = mdates.DateFormatter("%H:%M:%S", tz=self.display_tz)
         for col, source in enumerate(self.cfg.symbol_sources):
             key = source.normalized().display
-            if ':' in key:
-                exchange, symbol = key.split(':', 1)
-            else:
-                exchange, symbol = key, key
-            exchange_upper = exchange.upper()
-            symbol_upper = symbol.upper()
-            display_label = f"{exchange_upper} - {symbol_upper}"
+            _, symbol_display = self._extract_display_parts(key)
 
             ax_price = figure.add_subplot(3, ncols, col + 1)
-            ax_price.set_title(f"{display_label} Price")
-            ax_price.set_ylabel(f"Price ({exchange_upper})")
-            ax_price.grid(True, linestyle='--', alpha=0.3)
+            ax_price.set_title(f"{symbol_display} Price")
+            ax_price.set_ylabel("Price")
+            ax_price.grid(True, linestyle="--", alpha=0.3)
             ax_price.xaxis.set_major_formatter(time_formatter)
+            ax_price.tick_params(axis='x', rotation=20)
+            ax_price.tick_params(axis='x', labelbottom=False)
             self.axes_price[key] = ax_price
 
-            ax_cvd = figure.add_subplot(3, ncols, ncols + col + 1)
-            ax_cvd.set_title(f"{display_label} CVD")
-            ax_cvd.set_ylabel('CVD')
-            ax_cvd.grid(True, linestyle='--', alpha=0.3)
+            ax_cvd = figure.add_subplot(3, ncols, ncols + col + 1, sharex=ax_price)
+            ax_cvd.set_title(f"{symbol_display} CVD", color="#ef6c00")
+            ax_cvd.set_ylabel("CVD", color="#ef6c00")
+            ax_cvd.grid(True, linestyle="--", alpha=0.3)
             ax_cvd.xaxis.set_major_formatter(time_formatter)
+            ax_cvd.tick_params(axis='x', rotation=20)
+            ax_cvd.tick_params(axis='x', labelbottom=False)
+            ax_cvd.tick_params(axis='y', colors="#ef6c00")
+            ax_cvd.spines["left"].set_color("#ef6c00")
             self.axes_cvd[key] = ax_cvd
 
-            ax_imbal = figure.add_subplot(3, ncols, 2 * ncols + col + 1)
-            ax_imbal.set_title(f"{display_label} OB Imbalance")
-            ax_imbal.set_ylabel('盘口不平衡')
-            ax_imbal.set_ylim(-1, 1)
-            ax_imbal.grid(True, linestyle='--', alpha=0.3)
+            ax_imbal = figure.add_subplot(3, ncols, (2 * ncols) + col + 1, sharex=ax_price)
+            ax_imbal.set_title(f"{symbol_display} OB Imbalance", color="#8e24aa")
+            ax_imbal.set_ylabel("盘口不平衡", color="#8e24aa", labelpad=14)
+            ax_imbal.yaxis.set_label_position("left")
+            ax_imbal.yaxis.set_ticks_position("left")
+            ax_imbal.spines["left"].set_color("#8e24aa")
+            ax_imbal.spines["right"].set_visible(True)
+            ax_imbal.spines["right"].set_color("#212121")
+            ax_imbal.spines["right"].set_linewidth(ax_imbal.spines["left"].get_linewidth())
+            ax_imbal.grid(True, linestyle="--", alpha=0.3)
             ax_imbal.xaxis.set_major_formatter(time_formatter)
+            ax_imbal.tick_params(axis='x', rotation=20)
+            ax_imbal.tick_params(axis='y', colors="#8e24aa")
             self.axes_imbalance[key] = ax_imbal
-            ax_imbal.xaxis.set_major_formatter(time_formatter)
-            self.axes_imbalance[key] = ax_imbal
-            ax_imbal.set_ylabel("盘口不平衡")
-            self.axes_imbalance[key] = ax_imbal
-    
+
         self.canvas = FigureCanvasTkAgg(figure, master=self.chart_frame)
         self.canvas.draw()
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
         self.time_formatter = time_formatter
-    
+        self._update_chart_visibility()
     def apply_parameters(self) -> None:
         try:
             poll_interval = max(0.2, float(self.poll_interval_var.get()))
@@ -1249,15 +1716,21 @@ class MonitorGUI:
                 self._update_metrics(key, self.records_by_symbol[key][-1])
                 self._update_charts(key)
 
+        self._update_pair_selector()
         print(
-            f"[info] 参数已更新：poll={self.cfg.poll_interval}s, "
+            f"[info] 参数已更新: poll={self.cfg.poll_interval}s, "
             f"delta_window={self.cfg.delta_window}s, cvd_window={self.cfg.cvd_window}s, "
-            f"history={self.cfg.history_seconds}s, "
-            f"ob_smooth={self.cfg.imbalance_smooth_points}"
+            f"history={self.cfg.history_seconds}s, ob_smooth={self.cfg.imbalance_smooth_points}"
         )
-    # ------------------------------------------------------------------ Updates
 
     def update_ui(self) -> None:
+        if self._is_closing:
+            return
+        try:
+            if not self.root.winfo_exists():
+                return
+        except tk.TclError:
+            return
         updated_symbols: set[str] = set()
         try:
             while True:
@@ -1299,74 +1772,80 @@ class MonitorGUI:
         self.root.after(int(self.cfg.poll_interval * 1000), self.update_ui)
     
     def _update_metrics(self, symbol_key: str, record: Dict[str, Any]) -> None:
-        labels = self.metric_labels[symbol_key]
-        widgets = self.metric_widgets[symbol_key]
-    
-        timestamp = record.get('timestamp') or pd.Timestamp.utcnow().tz_localize("UTC")
-        labels['time'].set(self._format_display_time(timestamp))
-    
-        mid = record.get('mid')
-        labels['mid'].set(f"{mid:.2f}" if isinstance(mid, (int, float)) else '--')
-    
-        delta = float(record.get('delta', 0.0) or 0.0)
-        delta_sum = float(record.get('delta_sum', 0.0) or 0.0)
-        cvd = float(record.get('cvd', 0.0) or 0.0)
-        labels['delta'].set(f"{delta:.3f}")
-        labels['delta_sum'].set(f"{delta_sum:.3f}")
-        labels['cvd'].set(f"{cvd:.3f}")
-    
-        ob_raw = record.get('ob_imbalance')
-        ob = ob_raw
-        smooth_window = max(1, self.cfg.imbalance_smooth_points)
-        if smooth_window > 1:
-            history = self.records_by_symbol.get(symbol_key, [])
-            if history:
-                recent_values = [
-                    float(rec.get('ob_imbalance', float('nan')))
-                    for rec in history[-smooth_window:]
-                ]
-                series = pd.Series(recent_values, dtype="float64")
-                if not series.dropna().empty:
-                    ob = float(series.mean(skipna=True))
+        labels = self.metric_labels.get(symbol_key)
+        widgets = self.metric_widgets.get(symbol_key)
+        if not labels or not widgets:
+            return
 
-        if ob is None or (isinstance(ob, float) and pd.isna(ob)):
-            labels['ob'].set('NaN')
-            widgets['ob'].configure(fg='#607d8b')
-        else:
-            labels['ob'].set(f"{ob:.2f}")
-            if ob > 0.2:
-                widgets['ob'].configure(fg='#2e7d32')
-            elif ob < -0.2:
-                widgets['ob'].configure(fg='#c62828')
+        try:
+            timestamp = record.get('timestamp') or pd.Timestamp.utcnow().tz_localize("UTC")
+            labels['time'].set(self._format_display_time(timestamp))
+
+            mid = record.get('mid')
+            labels['mid'].set(f"{mid:.2f}" if isinstance(mid, (int, float)) else '--')
+
+            delta = float(record.get('delta', 0.0) or 0.0)
+            delta_sum = float(record.get('delta_sum', 0.0) or 0.0)
+            cvd = float(record.get('cvd', 0.0) or 0.0)
+            labels['delta'].set(f"{delta:.3f}")
+            labels['delta_sum'].set(f"{delta_sum:.3f}")
+            labels['cvd'].set(f"{cvd:.3f}")
+
+            ob_raw = record.get('ob_imbalance')
+            ob = ob_raw
+            smooth_window = max(1, self.cfg.imbalance_smooth_points)
+            if smooth_window > 1:
+                history = self.records_by_symbol.get(symbol_key, [])
+                if history:
+                    recent_values = [
+                        float(rec.get('ob_imbalance', float('nan')))
+                        for rec in history[-smooth_window:]
+                    ]
+                    series = pd.Series(recent_values, dtype="float64")
+                    if not series.dropna().empty:
+                        ob = float(series.mean(skipna=True))
+
+            if ob is None or (isinstance(ob, float) and pd.isna(ob)):
+                labels['ob'].set('NaN')
+                if widgets['ob'].winfo_exists():
+                    widgets['ob'].configure(fg='#607d8b')
             else:
-                widgets['ob'].configure(fg='#37474f')
-    
-        div = record.get('display_divergence') or record.get('divergence') or 'None'
-        labels['divergence'].set(div)
-        if 'Bullish' in div:
-            widgets['divergence'].configure(fg='#2e7d32')
-        elif 'Bearish' in div:
-            widgets['divergence'].configure(fg='#c62828')
-        else:
-            widgets['divergence'].configure(fg='#37474f')
-    
-        if delta > 0:
-            widgets['delta'].configure(fg='#2e7d32')
-        elif delta < 0:
-            widgets['delta'].configure(fg='#c62828')
-        else:
-            widgets['delta'].configure(fg='#37474f')
+                labels['ob'].set(f"{ob:.2f}")
+                if widgets['ob'].winfo_exists():
+                    if ob > 0.2:
+                        widgets['ob'].configure(fg='#2e7d32')
+                    elif ob < -0.2:
+                        widgets['ob'].configure(fg='#c62828')
+                    else:
+                        widgets['ob'].configure(fg='#37474f')
+
+            div = record.get('display_divergence') or record.get('divergence') or 'None'
+            labels['divergence'].set(div)
+            if widgets['divergence'].winfo_exists():
+                if 'Bullish' in div:
+                    widgets['divergence'].configure(fg='#2e7d32')
+                elif 'Bearish' in div:
+                    widgets['divergence'].configure(fg='#c62828')
+                else:
+                    widgets['divergence'].configure(fg='#37474f')
+
+            if widgets['delta'].winfo_exists():
+                if delta > 0:
+                    widgets['delta'].configure(fg='#2e7d32')
+                elif delta < 0:
+                    widgets['delta'].configure(fg='#c62828')
+                else:
+                    widgets['delta'].configure(fg='#37474f')
+
+        except tk.TclError:
+            return
     
     def _update_charts(self, symbol_key: str) -> None:
         records = self.records_by_symbol.get(symbol_key, [])
         if not records:
             return
 
-        if ":" in symbol_key:
-            exchange, _symbol = symbol_key.split(":", 1)
-        else:
-            exchange, _symbol = symbol_key, symbol_key
-        exchange_upper = exchange.upper()
+        exchange_upper, symbol_display = self._extract_display_parts(symbol_key)
 
         times = [self._to_display_timestamp(r['timestamp']) for r in records]
         price = [float(r.get('mid', float('nan'))) for r in records]
@@ -1379,37 +1858,57 @@ class MonitorGUI:
         if smooth_window > 1:
             series = pd.Series(imbalance, dtype="float64")
             imbalance = series.rolling(window=smooth_window, min_periods=1).mean().tolist()
-    
+
         ax_price = self.axes_price[symbol_key]
         ax_cvd = self.axes_cvd[symbol_key]
         ax_imbal = self.axes_imbalance[symbol_key]
-    
+
         ax_price.clear()
         ax_cvd.clear()
         ax_imbal.clear()
-    
+
         ax_price.plot(times, price, color='#1976d2', label='Price')
-        ax_price.set_ylabel(f'Price ({exchange_upper})')
+        ax_price.set_title(f"{symbol_display} Price")
+        ax_price.set_ylabel('Price')
         ax_price.grid(True, linestyle='--', alpha=0.3)
         ax_price.xaxis.set_major_formatter(self.time_formatter)
         ax_price.tick_params(axis='x', rotation=20)
+        ax_price.tick_params(axis='x', labelbottom=False)
         ax_price.ticklabel_format(style='plain', useOffset=False, axis='y')
         ax_price.get_yaxis().get_major_formatter().set_scientific(False)
-    
-        ax_cvd.plot(times, cvd, color='#6a1b9a', label='CVD', linewidth=1.2)
-        ax_cvd.set_ylabel('CVD')
+
+        ax_cvd.plot(times, cvd, color='#ef6c00', label='CVD', linewidth=1.6, zorder=5)
+        ax_cvd.set_title(f"{symbol_display} CVD", color='#ef6c00')
+        ax_cvd.set_ylabel('CVD', color='#ef6c00')
         ax_cvd.grid(True, linestyle='--', alpha=0.3)
         ax_cvd.xaxis.set_major_formatter(self.time_formatter)
         ax_cvd.tick_params(axis='x', rotation=20)
-    
-        ax_imbal.axhline(0, color='#9e9e9e', linewidth=1, linestyle='--')
-        ax_imbal.plot(times, imbalance, color='#ff8f00')
-        ax_imbal.set_ylabel('盘口不平衡')
-        ax_imbal.set_ylim(-1, 1)
+        ax_cvd.tick_params(axis='x', labelbottom=False)
+        ax_cvd.tick_params(axis='y', colors='#ef6c00')
+        ax_cvd.spines['left'].set_color('#ef6c00')
+        ax_cvd.axhline(0, color='#ef6c00', linewidth=1, linestyle='--', alpha=0.4, zorder=4)
+
+        ax_imbal.plot(
+            times,
+            imbalance,
+            color='#8e24aa',
+            label='OB Imbalance',
+            linewidth=1.3,
+            alpha=0.85,
+            zorder=3,
+        )
+        ax_imbal.axhline(0, color='#8e24aa', linewidth=1, linestyle='--', alpha=0.5, zorder=2)
+        ax_imbal.set_ylabel('盘口不平衡', color='#8e24aa', labelpad=14)
+        ax_imbal.yaxis.set_label_position('left')
+        ax_imbal.yaxis.set_ticks_position('left')
+        ax_imbal.spines['left'].set_color('#8e24aa')
+        ax_imbal.spines['right'].set_visible(True)
+        ax_imbal.spines['right'].set_color('#212121')
+        ax_imbal.spines['right'].set_linewidth(ax_imbal.spines['left'].get_linewidth())
         ax_imbal.grid(True, linestyle='--', alpha=0.3)
         ax_imbal.xaxis.set_major_formatter(self.time_formatter)
         ax_imbal.tick_params(axis='x', rotation=20)
-    
+        ax_imbal.tick_params(axis='y', colors='#8e24aa')
         price_values = [p for p in price if not pd.isna(p)]
         price_range = max(price_values) - min(price_values) if price_values else 0.0
         base_price = price_values[-1] if price_values else 1.0
@@ -1464,6 +1963,48 @@ class MonitorGUI:
         self.figure.tight_layout()
         self.canvas.draw_idle()
 
+    def _align_zero_axes(self, ax_primary: Any, ax_secondary: Any, secondary_values: List[float]) -> None:
+        try:
+            lower_primary, upper_primary = ax_primary.get_ylim()
+        except Exception:
+            return
+        span_primary = upper_primary - lower_primary
+        if span_primary <= 0 or not (lower_primary < 0 < upper_primary):
+            return
+        zero_ratio = (0 - lower_primary) / span_primary
+        if zero_ratio <= 1e-3 or zero_ratio >= 1 - 1e-3:
+            # Avoid extreme ratios that would explode scaling
+            return
+
+        ratio = zero_ratio / (1 - zero_ratio)
+
+        try:
+            sec_lower, sec_upper = ax_secondary.get_ylim()
+        except Exception:
+            return
+
+        values = [sec_lower, sec_upper, 0.0]
+        for val in secondary_values:
+            if isinstance(val, (int, float)):
+                values.append(float(val))
+        required_lower = min(values)
+        required_upper = max(values)
+
+        if required_lower >= 0:
+            required_lower = -1e-6
+        if required_upper <= 0:
+            required_upper = 1e-6
+
+        upper_candidate = max(required_upper, (-required_lower) / ratio)
+        upper_candidate = max(upper_candidate, 1e-6)
+        lower_candidate = -ratio * upper_candidate
+        if lower_candidate > required_lower:
+            needed = -required_lower
+            upper_candidate = max(upper_candidate, needed / ratio)
+            lower_candidate = -ratio * upper_candidate
+
+        ax_secondary.set_ylim(lower_candidate, upper_candidate)
+
     def _to_display_timestamp(self, value: Any) -> pd.Timestamp:
         ts = pd.Timestamp(value)
         if ts.tzinfo is None:
@@ -1475,6 +2016,7 @@ class MonitorGUI:
 
     # ------------------------------------------------------------------ Shutdown
     def on_close(self) -> None:
+        self._is_closing = True
         if self.stop_callback is not None:
             try:
                 self.stop_callback()
@@ -1514,6 +2056,18 @@ def parse_args() -> MonitorConfig:
     parser.add_argument("--influx-bucket", type=str, default=None, help="InfluxDB bucket")
     parser.add_argument(
         "--influx-measurement", type=str, default=None, help="Measurement name (default: orderflow)"
+    )
+    parser.add_argument(
+        "--startup-backfill",
+        type=int,
+        default=None,
+        help="Seconds of synthetic backfill when no history exists (default: 900)",
+    )
+    parser.add_argument(
+        "--history-cache",
+        type=str,
+        default=None,
+        help="Path to local JSON cache for aggregated history (default: output/history_cache.json)",
     )
     args = parser.parse_args()
 
@@ -1571,6 +2125,15 @@ def parse_args() -> MonitorConfig:
                 cfg.divergence_window = max(10, int(divergence_default))
             except (TypeError, ValueError):
                 pass
+        backfill_default = getattr(app_config, "DEFAULT_STARTUP_BACKFILL_SECONDS", None)
+        if backfill_default is not None:
+            try:
+                cfg.startup_backfill_seconds = max(0, int(backfill_default))
+            except (TypeError, ValueError):
+                pass
+        history_cache_default = getattr(app_config, "HISTORY_CACHE_PATH", None)
+        if history_cache_default is not None:
+            cfg.history_cache_path = str(history_cache_default)
         symbols_default = getattr(app_config, "DEFAULT_SYMBOLS", None)
         if symbols_default:
             loaded_sources: List[SymbolSource] = []
@@ -1602,6 +2165,10 @@ def parse_args() -> MonitorConfig:
         cfg.imbalance_smooth_points = max(1, args.imbalance_smooth)
     if args.divergence_window is not None:
         cfg.divergence_window = max(10, args.divergence_window)
+    if args.startup_backfill is not None:
+        cfg.startup_backfill_seconds = max(0, args.startup_backfill)
+    if args.history_cache is not None:
+        cfg.history_cache_path = args.history_cache
     if args.influx_url is not None:
         cfg.influx_url = args.influx_url
     if args.influx_token is not None:
@@ -1637,20 +2204,38 @@ def main() -> None:
         else:
             print("[warn] InfluxDB parameters incomplete; skipping export.")
 
+    history_cache = HistoryCache(
+        cfg.history_cache_path,
+        max(cfg.history_seconds, cfg.startup_backfill_seconds),
+    )
+
     initial_history: Dict[str, List[Dict[str, Any]]] = {}
     if influx_publisher is not None:
-        initial_fetch_seconds = max(
-            cfg.history_seconds,
-            getattr(app_config, "INITIAL_FETCH_SECONDS", 3600) if app_config else 3600,
-        )
+        fetch_seconds = max(cfg.history_seconds, 3600)
         for source in cfg.symbol_sources:
-            history = influx_publisher.fetch_recent(source, initial_fetch_seconds)
+            history = influx_publisher.fetch_recent(source, fetch_seconds)
             if history:
                 initial_history[source.normalized().display] = history
+    local_history = history_cache.load_all(cfg.symbol_sources)
+    for key, records in local_history.items():
+        initial_history.setdefault(key, records)
+    for source in cfg.symbol_sources:
+        key = source.normalized().display
+        if key in initial_history:
+            continue
+        rest_records = fetch_rest_history(source, cfg)
+        if rest_records:
+            initial_history[key] = rest_records
 
     monitors: List[OrderFlowMonitor] = []
     for source in cfg.symbol_sources:
-        monitor = OrderFlowMonitor(source, cfg, record_queue, publisher=influx_publisher)
+        monitor = OrderFlowMonitor(
+            source,
+            cfg,
+            record_queue,
+            publisher=influx_publisher,
+            history_cache=history_cache,
+        )
         key = source.normalized().display
         if key in initial_history:
             monitor.seed_history(initial_history[key])
@@ -1662,6 +2247,7 @@ def main() -> None:
             m.stop()
         if influx_publisher is not None:
             influx_publisher.close()
+        history_cache.flush()
 
     gui = MonitorGUI(
         cfg,

@@ -1,7 +1,7 @@
 """
 Helpers for fetching and caching popular trading pairs.
 
-The module downloads volume-ranked symbols for Coinbase and OKX,
+The module downloads volume-ranked symbols for Coinbase,
 persists them to a local cache, and exposes helpers for the GUI to
 populate "hot pair" selectors. The cache is refreshed automatically
 when missing or older than 100 hours.
@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, List, Tuple
 
 import requests
 
@@ -21,7 +21,6 @@ CACHE_MAX_AGE = timedelta(hours=100)
 DEFAULT_LIMIT = 50
 COINBASE_PRODUCTS_STATS_URL = "https://api.exchange.coinbase.com/products/stats"
 COINBASE_PRODUCTS_URL = "https://api.exchange.coinbase.com/products"
-OKX_TICKERS_URL = "https://www.okx.com/api/v5/market/tickers?instType=SPOT"
 
 CACHE_FILE = Path(__file__).with_name("coinpair_cache.json")
 
@@ -119,57 +118,10 @@ def _fetch_coinbase_pairs(limit: int) -> List[str]:
     return sorted(top)
 
 
-def _fetch_okx_pairs(limit: int) -> List[str]:
-    resp = requests.get(OKX_TICKERS_URL, timeout=15)
-    resp.raise_for_status()
-    payload = resp.json()
-    data = payload.get('data') if isinstance(payload, dict) else None
-    if not isinstance(data, list):
-        raise ValueError('Unexpected OKX response structure')
-
-    items = []
-    for item in data:
-        if not isinstance(item, dict):
-            continue
-        inst_id = str(item.get('instId') or '').upper()
-        if not inst_id:
-            continue
-        try:
-            last = float(item.get('last') or 0.0)
-        except (TypeError, ValueError):
-            last = 0.0
-        try:
-            vol_base = float(item.get('vol24h') or 0.0)
-        except (TypeError, ValueError):
-            vol_base = 0.0
-        try:
-            vol_quote = float(item.get('volCcy24h') or 0.0)
-        except (TypeError, ValueError):
-            vol_quote = 0.0
-        market_cap_est = last * vol_base if last and vol_base else vol_quote * last
-        if market_cap_est <= 0:
-            market_cap_est = last
-        items.append({"inst_id": inst_id, "vol_quote": vol_quote, "market_cap": market_cap_est})
-
-    by_volume = sorted(items, key=lambda entry: entry['vol_quote'], reverse=True)
-    by_market_cap = sorted(items, key=lambda entry: entry['market_cap'], reverse=True)
-
-    combined: List[str] = []
-    for entry in by_volume[:limit]:
-        inst = entry['inst_id']
-        if inst not in combined:
-            combined.append(inst)
-    for entry in by_market_cap[:limit]:
-        inst = entry['inst_id']
-        if inst not in combined:
-            combined.append(inst)
-    return combined[:limit]
-
 def _download_pairs(limit: int) -> PairCache:
     fetched_at = _utcnow()
     pairs = {
         "COINBASE": _fetch_coinbase_pairs(limit),
-        "OKX": _fetch_okx_pairs(limit),
     }
     cache = PairCache(fetched_at=fetched_at, pairs=pairs)
     _save_cache(cache)
@@ -184,7 +136,6 @@ def ensure_pairs(limit: int = DEFAULT_LIMIT) -> PairCache:
         return _download_pairs(limit)
     except Exception:
         if cache is not None:
-            # Fall back to stale cache if fetch fails.
             return cache
         raise
 
@@ -204,6 +155,4 @@ def get_pairs_for_exchange(exchange: str, limit: int = DEFAULT_LIMIT) -> List[st
 
 
 def pairs_to_choices(exchange: str, limit: int = DEFAULT_LIMIT) -> List[str]:
-    """Convenience helper returning colon-separated tokens."""
     return [f"{exchange.lower()}:{symbol.lower()}" for symbol in get_pairs_for_exchange(exchange, limit)]
-
