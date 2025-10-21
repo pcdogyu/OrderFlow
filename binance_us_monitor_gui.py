@@ -39,7 +39,7 @@ DISPLAY_TZ = ZoneInfo("Asia/Shanghai")
 UTC_TZ = ZoneInfo("UTC")
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Set, Tuple
 
 import pandas as pd
 import websocket
@@ -98,7 +98,7 @@ class MonitorConfig:
     cvd_window: int = 60
     imbalance_smooth_points: int = 5
     divergence_window: int = 300
-    startup_backfill_seconds: int = 900
+    startup_backfill_seconds: int = 3600
     history_cache_path: Optional[str] = None
     price_tolerance: float = 0.0005
     cvd_tolerance: float = 0.25
@@ -108,6 +108,37 @@ class MonitorConfig:
     influx_bucket: Optional[str] = None
     influx_measurement: str = "orderflow"
 
+    # Strategy overlay defaults
+    strategy_enabled: bool = True
+    strategy_lookback_seconds: int = 120
+    strategy_delta_threshold: float = 5.0
+    strategy_long_imbalance: float = 0.20
+    strategy_short_imbalance: float = -0.20
+    strategy_cvd_slope_threshold: float = 0.0
+    strategy_min_signal_score: float = 0.66
+
+
+STRATEGY_SIGNAL_DISPLAY = {
+    "LONG": "做多",
+    "LEAN_LONG": "偏多",
+    "SHORT": "做空",
+    "LEAN_SHORT": "偏空",
+    "HOLD": "观望",
+    "DISABLED": "关闭",
+}
+
+STRATEGY_REASON_DISPLAY = {
+    "OB Bid Bias": "盘口偏多",
+    "OB Ask Bias": "盘口偏空",
+    "Delta Accum": "Delta净买",
+    "Delta Sell": "Delta净卖",
+    "CVD Up": "CVD上行",
+    "CVD Down": "CVD下行",
+    "Await alignment": "等待共振",
+    "Strategy overlay disabled": "策略功能关闭",
+}
+
+STRATEGY_REASON_SKIP = {"Strategy overlay disabled", "Await alignment"}
 
 
 
@@ -172,6 +203,27 @@ def configure_chinese_font() -> Optional[str]:
 
 COINBASE_QUOTES = ("usdt", "usdc", "usd", "eur", "gbp", "btc", "eth", "ada", "sol")
 OKX_SPOT_QUOTES = ("usdt", "usdc", "usd", "btc", "eth", "eur", "gbp", "jpy", "cnh")
+
+KRAKEN_OI_BASE_MAP = {
+    "BTC": "PI_XBTUSD",
+    "ETH": "PI_ETHUSD",
+}
+
+
+def resolve_kraken_oi_symbol(symbol: str) -> Optional[str]:
+    """Map normalized spot symbol (e.g., BTC-USDT) to Kraken Futures instrument."""
+    if not symbol:
+        return None
+    clean = symbol.upper().replace("/", "-")
+    if "-" in clean:
+        base = clean.split("-", 1)[0]
+    else:
+        base = clean
+        for suffix in ("USDT", "USD", "USDC", "EUR"):
+            if base.endswith(suffix):
+                base = base[: -len(suffix)]
+                break
+    return KRAKEN_OI_BASE_MAP.get(base)
 
 
 def normalize_exchange_symbol(exchange: str, symbol: str) -> Tuple[str, str]:
@@ -329,6 +381,9 @@ class HistoryCache:
                 "buy_vol": _safe_float(item.get("buy_vol")) or 0.0,
                 "sell_vol": _safe_float(item.get("sell_vol")) or 0.0,
             }
+            oi_value = _safe_float(item.get("oi"))
+            if oi_value is not None:
+                record["oi"] = oi_value
             restored.append(record)
         restored.sort(key=lambda r: r["timestamp"])
         return restored
@@ -366,6 +421,9 @@ class HistoryCache:
                 "buy_vol": _safe_float(rec.get("buy_vol")) or 0.0,
                 "sell_vol": _safe_float(rec.get("sell_vol")) or 0.0,
             }
+            oi_value = _safe_float(rec.get("oi"))
+            if oi_value is not None:
+                entry["oi"] = oi_value
             sanitized.append(entry)
         if not sanitized:
             return
@@ -389,6 +447,70 @@ class HistoryCache:
 REST_TIMEOUT = 10
 
 
+class KrakenFuturesOI:
+    """Simple cached fetcher for Kraken Futures open-interest values."""
+
+    API_URL = "https://futures.kraken.com/derivatives/api/v3/openinterest"
+    CACHE_TTL = 30  # seconds
+
+    def __init__(self) -> None:
+        self._cache: Dict[str, float] = {}
+        self._last_fetch: float = 0.0
+        self._lock = threading.Lock()
+        self._missing_logged: set[str] = set()
+
+    def _refresh_cache(self) -> None:
+        now = time.time()
+        if now - self._last_fetch < self.CACHE_TTL:
+            return
+        with self._lock:
+            if now - self._last_fetch < self.CACHE_TTL:
+                return
+            try:
+                resp = requests.get(self.API_URL, timeout=REST_TIMEOUT)
+                resp.raise_for_status()
+                payload = resp.json()
+            except Exception as exc:
+                print(f"[warn] Kraken OI fetch failed: {exc}")
+                self._last_fetch = now
+                return
+            items = payload.get("openInterest")
+            if not isinstance(items, list):
+                self._last_fetch = now
+                return
+            refreshed: Dict[str, float] = {}
+            for entry in items:
+                if not isinstance(entry, dict):
+                    continue
+                symbol = entry.get("symbol")
+                value = entry.get("openInterest")
+                try:
+                    if symbol and value is not None:
+                        refreshed[str(symbol)] = float(value)
+                except (TypeError, ValueError):
+                    continue
+            self._cache = refreshed
+            self._last_fetch = now
+            sample = list(refreshed.items())[:3]
+            print(f"[info] Kraken OI refreshed ({len(refreshed)} instruments): {sample}")
+
+    def get(self, instrument: Optional[str]) -> Optional[float]:
+        if instrument is None:
+            return None
+        self._refresh_cache()
+        with self._lock:
+            value = self._cache.get(instrument)
+            if value is None:
+                if instrument not in self._missing_logged:
+                    print(f"[warn] Kraken OI missing instrument '{instrument}'")
+                    self._missing_logged.add(instrument)
+                return None
+            return float(value)
+
+
+KRAKEN_OI_CLIENT = KrakenFuturesOI()
+
+
 def _build_records_from_trades(
     trades: List[Dict[str, Any]],
     cfg: MonitorConfig,
@@ -396,6 +518,7 @@ def _build_records_from_trades(
     ob_mid: Optional[float],
     ob_imbalance: Optional[float],
     source: SymbolSource,
+    oi_symbol: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     if not trades:
         return []
@@ -474,7 +597,12 @@ def _build_records_from_trades(
                 "symbol": source.symbol.upper(),
             }
         )
-    return records[-2000:]
+    records = records[-2000:]
+    oi_value = KRAKEN_OI_CLIENT.get(oi_symbol)
+    if oi_value is not None:
+        for rec in records:
+            rec["oi"] = oi_value
+    return records
 
 
 def _fetch_binance_rest_history(source: SymbolSource, seconds: int, cfg: MonitorConfig) -> List[Dict[str, Any]]:
@@ -532,13 +660,96 @@ def _fetch_binance_rest_history(source: SymbolSource, seconds: int, cfg: Monitor
             ob_imbalance = (bid_qty - ask_qty) / denom
     except Exception:
         pass
-    return _build_records_from_trades(normalized, cfg, seconds, ob_mid, ob_imbalance, source)
+    oi_symbol = resolve_kraken_oi_symbol(source.symbol.upper().replace("/", "-"))
+    return _build_records_from_trades(normalized, cfg, seconds, ob_mid, ob_imbalance, source, oi_symbol)
 
+def _fetch_coinbase_candles(product_id: str, minutes: int) -> List[Dict[str, Any]]:
+    if requests is None:
+        return []
+    minutes = max(1, minutes)
+    end_time = pd.Timestamp.utcnow().ceil("T")
+    start_time = end_time - pd.Timedelta(minutes=minutes)
+    params = {
+        "granularity": 60,
+        "start": start_time.isoformat(),
+        "end": end_time.isoformat(),
+    }
+    try:
+        resp = requests.get(
+            f"https://api.exchange.coinbase.com/products/{product_id}/candles",
+            params=params,
+            timeout=REST_TIMEOUT,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+    except Exception:
+        return []
+    if not isinstance(payload, list):
+        return []
+    candles = [
+        item
+        for item in payload
+        if isinstance(item, (list, tuple)) and len(item) >= 6 and _safe_float(item[4]) is not None
+    ]
+    if not candles:
+        return []
+    candles.sort(key=lambda entry: entry[0])
+    records: List[Dict[str, Any]] = []
+    for entry in candles:
+        ts = pd.Timestamp(entry[0], unit="s").tz_localize(None) + pd.Timedelta(seconds=60)
+        close_price = float(entry[4])
+        records.append(
+            {
+                "timestamp": ts,
+                "mid": close_price,
+                "delta": 0.0,
+                "delta_sum": 0.0,
+                "cvd": 0.0,
+                "ob_imbalance": float("nan"),
+                "buy_vol": 0.0,
+                "sell_vol": 0.0,
+            }
+        )
+    return records[-minutes:]
 
 def _fetch_coinbase_rest_history(source: SymbolSource, seconds: int, cfg: MonitorConfig) -> List[Dict[str, Any]]:
     if requests is None:
         return []
     product_id = source.symbol.upper()
+    minutes = max(1, int(math.ceil(seconds / 60)))
+    candles = _fetch_coinbase_candles(product_id, minutes)
+    if candles:
+        ob_mid = None
+        ob_imbalance = float("nan")
+        try:
+            ob_resp = requests.get(
+                f"https://api.exchange.coinbase.com/products/{product_id}/book",
+                params={"level": 1},
+                timeout=REST_TIMEOUT,
+            )
+            ob_resp.raise_for_status()
+            book = ob_resp.json()
+            bids = book.get("bids") or []
+            asks = book.get("asks") or []
+            bid = _safe_float(bids[0][0]) if bids and isinstance(bids[0], (list, tuple)) else None
+            ask = _safe_float(asks[0][0]) if asks and isinstance(asks[0], (list, tuple)) else None
+            bid_qty = _safe_float(bids[0][1]) if bids and isinstance(bids[0], (list, tuple)) else 0.0
+            ask_qty = _safe_float(asks[0][1]) if asks and isinstance(asks[0], (list, tuple)) else 0.0
+            if bid is not None and ask is not None:
+                ob_mid = (bid + ask) / 2
+            denom = bid_qty + ask_qty
+            if denom > 0:
+                ob_imbalance = (bid_qty - ask_qty) / denom
+        except Exception:
+            pass
+        if ob_mid is not None and candles:
+            candles[-1]["mid"] = ob_mid
+        if candles:
+            candles[-1]["ob_imbalance"] = ob_imbalance
+        for entry in candles:
+            entry["exchange"] = source.exchange.upper()
+            entry["symbol"] = source.symbol.upper()
+        return candles
     cutoff = pd.Timestamp.utcnow().tz_localize(None) - pd.Timedelta(seconds=seconds)
     trades: List[Dict[str, Any]] = []
     params: Dict[str, Any] = {"limit": 100}
@@ -599,12 +810,18 @@ def _fetch_coinbase_rest_history(source: SymbolSource, seconds: int, cfg: Monito
             ob_imbalance = (bid_qty - ask_qty) / denom
     except Exception:
         pass
-    return _build_records_from_trades(trades, cfg, seconds, ob_mid, ob_imbalance, source)
+    oi_symbol = resolve_kraken_oi_symbol(source.symbol.upper().replace("/", "-"))
+    return _build_records_from_trades(trades, cfg, seconds, ob_mid, ob_imbalance, source, oi_symbol)
 
 
-def fetch_rest_history(source: SymbolSource, cfg: MonitorConfig) -> List[Dict[str, Any]]:
+def fetch_rest_history(
+    source: SymbolSource, cfg: MonitorConfig, seconds_override: Optional[int] = None
+) -> List[Dict[str, Any]]:
     normalized = source.normalized()
-    seconds = min(max(60, cfg.startup_backfill_seconds), cfg.history_seconds)
+    if seconds_override is not None:
+        seconds = max(60, int(seconds_override))
+    else:
+        seconds = min(max(60, cfg.startup_backfill_seconds), cfg.history_seconds)
     if seconds <= 0:
         return []
     try:
@@ -656,7 +873,33 @@ class InfluxPublisher:
             .tag("exchange", source.exchange.upper())
             .tag("symbol", source.symbol.upper())
         )
-        for field in ("mid", "delta", "delta_sum", "cvd", "ob_imbalance", "buy_vol", "sell_vol"):
+        strategy_signal = record.get("strategy_signal")
+        if strategy_signal:
+            try:
+                point = point.tag("strategy_signal", str(strategy_signal))
+            except Exception:
+                pass
+        strategy_bias = record.get("strategy_bias")
+        if strategy_bias:
+            try:
+                point = point.tag("strategy_bias", str(strategy_bias))
+            except Exception:
+                pass
+        for field in (
+            "mid",
+            "delta",
+            "delta_sum",
+            "cvd",
+            "ob_imbalance",
+            "buy_vol",
+            "sell_vol",
+            "strategy_confidence",
+            "strategy_long_confidence",
+            "strategy_short_confidence",
+            "strategy_ob_avg",
+            "strategy_delta_sum",
+            "strategy_cvd_slope",
+        ):
             value = record.get(field)
             if value is None:
                 continue
@@ -773,12 +1016,18 @@ class OrderFlowMonitor:
         self.cvd_window_values: Deque[Tuple[pd.Timestamp, float]] = deque()
         self.delta_sum_value: float = 0.0
         self.cvd_value: float = 0.0
+        self.kraken_oi_symbol: Optional[str] = resolve_kraken_oi_symbol(self.symbol_upper.replace("_", "-"))
 
         self.ws_app: Optional[websocket.WebSocketApp] = None
         self.stop_event = threading.Event()
         self.lock = threading.Lock()
         self._backfill_done = False
         self._last_cache_flush = 0.0
+
+        self.strategy_state: Dict[str, Any] = {
+            "last_signal": "HOLD",
+            "last_change": None,
+        }
 
     @staticmethod
     def _ensure_naive(ts: Any) -> pd.Timestamp:
@@ -1086,6 +1335,10 @@ class OrderFlowMonitor:
         self.cvd_window_values.clear()
         self.delta_sum_value = 0.0
         self.cvd_value = 0.0
+        self.strategy_state = {
+            "last_signal": "HOLD",
+            "last_change": None,
+        }
         if not self.stats:
             return
         last_ts = self._ensure_naive(self.stats[-1]["timestamp"])
@@ -1103,6 +1356,9 @@ class OrderFlowMonitor:
         if self.stats:
             self._backfill_done = True
             self._persist_history_snapshot(force=True)
+            last = self.stats[-1]
+            info = self._evaluate_strategy(last, self._ensure_naive(last["timestamp"]))
+            last.update(info)
 
     def _update_window(
         self,
@@ -1189,6 +1445,145 @@ class OrderFlowMonitor:
                 return "看涨背离 / Bullish"
         return ""
 
+    def _evaluate_strategy(self, record: Dict[str, Any], now: pd.Timestamp) -> Dict[str, Any]:
+        if not self.cfg.strategy_enabled:
+            return {
+                "strategy_signal": "DISABLED",
+                "strategy_bias": "NEUTRAL",
+                "strategy_confidence": 0.0,
+                "strategy_long_confidence": 0.0,
+                "strategy_short_confidence": 0.0,
+                "strategy_reason": "Strategy overlay disabled",
+                "strategy_ob_avg": record.get("ob_imbalance"),
+                "strategy_delta_sum": record.get("delta_sum"),
+                "strategy_cvd_slope": 0.0,
+                "strategy_last_change": self.strategy_state.get("last_change"),
+            }
+
+        lookback_seconds = max(30, int(self.cfg.strategy_lookback_seconds))
+        lookback = pd.Timedelta(seconds=lookback_seconds)
+        relevant: List[Dict[str, Any]] = []
+        for rec in reversed(self.stats):
+            ts = self._ensure_naive(rec["timestamp"])
+            if now - ts <= lookback:
+                relevant.append(rec)
+            else:
+                break
+
+        if not relevant:
+            relevant = [record]
+        relevant = list(reversed(relevant))
+
+        delta_values = [float(r.get("delta", 0.0) or 0.0) for r in relevant]
+        delta_sum = float(sum(delta_values))
+
+        ob_values: List[float] = []
+        for r in relevant:
+            value = r.get("ob_imbalance")
+            if value is None:
+                continue
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                continue
+            if not pd.isna(value):
+                ob_values.append(float(value))
+        if ob_values:
+            ob_avg = float(sum(ob_values) / len(ob_values))
+        else:
+            ob_avg = float("nan")
+
+        cvd_start = float(relevant[0].get("cvd", 0.0) or 0.0)
+        cvd_end = float(relevant[-1].get("cvd", 0.0) or 0.0)
+        start_ts = self._ensure_naive(relevant[0]["timestamp"])
+        end_ts = self._ensure_naive(relevant[-1]["timestamp"])
+        elapsed = max((end_ts - start_ts).total_seconds(), 1.0)
+        cvd_slope = (cvd_end - cvd_start) / elapsed
+
+        long_reasons: List[str] = []
+        short_reasons: List[str] = []
+
+        metrics_available = 3
+        if math.isnan(ob_avg):
+            metrics_available -= 1
+
+        if not math.isnan(ob_avg):
+            if ob_avg >= self.cfg.strategy_long_imbalance:
+                long_reasons.append("OB Bid Bias")
+            if ob_avg <= self.cfg.strategy_short_imbalance:
+                short_reasons.append("OB Ask Bias")
+
+        if delta_sum >= self.cfg.strategy_delta_threshold:
+            long_reasons.append("Delta Accum")
+        if delta_sum <= -self.cfg.strategy_delta_threshold:
+            short_reasons.append("Delta Sell")
+
+        slope_threshold = abs(self.cfg.strategy_cvd_slope_threshold)
+        if slope_threshold == 0.0:
+            slope_threshold = 1e-6
+        if cvd_slope >= slope_threshold:
+            long_reasons.append("CVD Up")
+        if cvd_slope <= -slope_threshold:
+            short_reasons.append("CVD Down")
+
+        available = max(metrics_available, 1)
+        long_confidence = min(1.0, len(long_reasons) / available)
+        short_confidence = min(1.0, len(short_reasons) / available)
+        bias = "NEUTRAL"
+        if long_confidence > short_confidence:
+            bias = "LONG"
+        elif short_confidence > long_confidence:
+            bias = "SHORT"
+
+        min_score = min(max(self.cfg.strategy_min_signal_score, 0.0), 1.0)
+        signal = "HOLD"
+        active_reasons: List[str] = []
+        confidence = max(long_confidence, short_confidence)
+
+        if long_confidence >= min_score and long_confidence >= short_confidence:
+            signal = "LONG"
+            active_reasons = long_reasons
+            confidence = long_confidence
+        elif short_confidence >= min_score and short_confidence >= long_confidence:
+            signal = "SHORT"
+            active_reasons = short_reasons
+            confidence = short_confidence
+        else:
+            lean_threshold = max(0.4, min_score * 0.75)
+            if long_confidence >= lean_threshold and long_confidence > short_confidence:
+                signal = "LEAN_LONG"
+                active_reasons = long_reasons
+                confidence = long_confidence
+            elif short_confidence >= lean_threshold and short_confidence > long_confidence:
+                signal = "LEAN_SHORT"
+                active_reasons = short_reasons
+                confidence = short_confidence
+            else:
+                signal = "HOLD"
+                active_reasons = long_reasons if bias == "LONG" else short_reasons if bias == "SHORT" else []
+
+        last_signal = self.strategy_state.get("last_signal")
+        if signal != last_signal:
+            self.strategy_state["last_signal"] = signal
+            self.strategy_state["last_change"] = now
+        elif self.strategy_state.get("last_change") is None:
+            self.strategy_state["last_change"] = now
+
+        reason = ", ".join(active_reasons) if active_reasons else "Await alignment"
+        info = {
+            "strategy_signal": signal,
+            "strategy_bias": bias,
+            "strategy_confidence": float(round(confidence, 4)),
+            "strategy_long_confidence": float(round(long_confidence, 4)),
+            "strategy_short_confidence": float(round(short_confidence, 4)),
+            "strategy_reason": reason,
+            "strategy_ob_avg": ob_avg,
+            "strategy_delta_sum": delta_sum,
+            "strategy_cvd_slope": cvd_slope,
+            "strategy_last_change": self.strategy_state.get("last_change"),
+        }
+        return info
+
     def aggregate_once(self) -> Optional[Dict[str, Any]]:
         now = self._ensure_naive(pd.Timestamp.utcnow())
         window_start = now - pd.Timedelta(seconds=self.cfg.history_seconds)
@@ -1236,6 +1631,9 @@ class OrderFlowMonitor:
             "buy_vol": buy_vol,
             "sell_vol": sell_vol,
         }
+        oi_val = KRAKEN_OI_CLIENT.get(self.kraken_oi_symbol)
+        if oi_val is not None:
+            record["oi"] = oi_val
         if not self.stats:
             self._ensure_startup_backfill(record)
         self.stats.append(record)
@@ -1243,6 +1641,8 @@ class OrderFlowMonitor:
             now - self._ensure_naive(self.stats[0]["timestamp"])
         ).total_seconds() > self.cfg.history_seconds:
             self.stats.popleft()
+        strategy_info = self._evaluate_strategy(record, now)
+        record.update(strategy_info)
         record["divergence"] = self.detect_divergence()
         if record["divergence"]:
             record["display_divergence"] = record["divergence"]
@@ -1336,6 +1736,21 @@ class MonitorGUI:
         self.ui_font_family = preferred_font or base_font.cget("family")
         self.heading_font = tkfont.Font(family=self.ui_font_family, size=9, weight="bold")
         self.value_font = tkfont.Font(family=self.ui_font_family, size=12)
+        self.strategy_font = tkfont.Font(family=self.ui_font_family, size=10)
+        self.timeframe_presets: List[Tuple[str, int]] = [
+            ("5M", 5),
+            ("15M", 15),
+            ("30M", 30),
+            ("1H", 60),
+            ("4H", 240),
+        ]
+        self.timeframe_minutes_map: Dict[str, int] = {
+            label: minutes for label, minutes in self.timeframe_presets
+        }
+        default_timeframe = "1H" if "1H" in self.timeframe_minutes_map else self.timeframe_presets[0][0]
+        self.timeframe_var = tk.StringVar(value=default_timeframe)
+        self.selected_timeframe_minutes = self.timeframe_minutes_map.get(default_timeframe, 60)
+        self._price_fill_thread: Optional[threading.Thread] = None
 
         self._build_widgets()
         self._setup_plot()
@@ -1358,8 +1773,14 @@ class MonitorGUI:
         mainframe = ttk.Frame(self.root, padding="8 8 8 8")
         mainframe.pack(fill=tk.BOTH, expand=True)
 
-        control_frame = ttk.LabelFrame(mainframe, text="参数设置 Parameters", padding="6")
-        control_frame.pack(fill=tk.X, pady=(0, 6))
+        top_container = ttk.Frame(mainframe)
+        top_container.pack(fill=tk.X, pady=(0, 6))
+        top_container.columnconfigure(0, weight=0)
+        top_container.columnconfigure(1, weight=1)
+        top_container.rowconfigure(0, weight=1)
+
+        control_frame = ttk.LabelFrame(top_container, text="�������� Parameters", padding="6")
+        control_frame.grid(row=0, column=0, sticky="nw")
 
         self.poll_interval_var = tk.DoubleVar(value=self.cfg.poll_interval)
         self.delta_window_var = tk.IntVar(value=self.cfg.delta_window)
@@ -1383,7 +1804,7 @@ class MonitorGUI:
             spin.pack(anchor="w")
             return spin
 
-        for col in range(5):
+        for col in range(7):
             control_frame.columnconfigure(col, weight=0)
 
         add_control(0, "刷新周期(s)", self.poll_interval_var, 0.2, 5.0, 0.1, "%.2f")
@@ -1395,9 +1816,25 @@ class MonitorGUI:
         ttk.Button(control_frame, text="应用 Apply", command=self.apply_parameters).grid(
             row=0, column=5, padx=8, pady=2
         )
+        self.price_fill_button = ttk.Button(
+            control_frame, text="Price Fill", command=self._on_price_fill_clicked
+        )
+        self.price_fill_button.grid(row=0, column=6, padx=8, pady=2)
 
-        metrics_frame = ttk.LabelFrame(mainframe, text="实时指标 Live Metrics", padding="6")
-        metrics_frame.pack(fill=tk.X)
+        timeframe_frame = ttk.Frame(control_frame)
+        timeframe_frame.grid(row=1, column=0, columnspan=7, sticky="w", pady=(4, 0))
+        ttk.Label(timeframe_frame, text="Price Span:").pack(side=tk.LEFT, padx=(0, 6))
+        for label, _ in self.timeframe_presets:
+            ttk.Radiobutton(
+                timeframe_frame,
+                text=label,
+                value=label,
+                variable=self.timeframe_var,
+                command=self._on_timeframe_change,
+            ).pack(side=tk.LEFT, padx=2)
+
+        metrics_frame = ttk.LabelFrame(top_container, text="ʵʱָ�� Live Metrics", padding="6")
+        metrics_frame.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
 
         self.metric_labels: Dict[str, Dict[str, tk.StringVar]] = {}
         self.metric_widgets: Dict[str, Dict[str, tk.Label]] = {}
@@ -1416,7 +1853,7 @@ class MonitorGUI:
         )
         self.pair_selector.grid(row=0, column=1, padx=(0, 12))
         self.pair_selector.bind("<<ComboboxSelected>>", lambda _: self._on_pair_selected())
-        ttk.Label(selector_frame, text="热门更新:").grid(row=0, column=2, padx=(0, 4))
+        ttk.Label(selector_frame, text="").grid(row=0, column=2, padx=(0, 4))
         self.hot_pairs_update_label = ttk.Label(selector_frame, text="")
         self.hot_pairs_update_label.grid(row=0, column=3, sticky="w")
         selector_frame.columnconfigure(4, weight=1)
@@ -1438,17 +1875,18 @@ class MonitorGUI:
 
             grid = ttk.Frame(block)
             grid.pack(fill=tk.BOTH, expand=True, padx=4, pady=2)
-            for col in range(7):
+            for col in range(8):
                 grid.columnconfigure(col, weight=1)
 
             vars_map = {
-                "time": tk.StringVar(value="--:--:--"),
                 "mid": tk.StringVar(value="--"),
                 "delta": tk.StringVar(value="--"),
                 "delta_sum": tk.StringVar(value="--"),
                 "cvd": tk.StringVar(value="--"),
+                "oi": tk.StringVar(value="--"),
                 "ob": tk.StringVar(value="--"),
                 "divergence": tk.StringVar(value="None"),
+                "strategy": tk.StringVar(value="HOLD"),
             }
             self.metric_labels[key] = vars_map
             self.heading_labels[key] = {}
@@ -1461,7 +1899,8 @@ class MonitorGUI:
                 heading = ttk.Label(cell, text=f"{title}\n{subtitle}", font=self.heading_font)
                 heading.pack(anchor=tk.W)
                 self.heading_labels[key][label_key] = heading
-                lbl = tk.Label(cell, textvariable=vars_map[label_key], font=self.value_font)
+                value_font = self.strategy_font if label_key == "strategy" else self.value_font
+                lbl = tk.Label(cell, textvariable=vars_map[label_key], font=value_font)
                 lbl.pack(anchor=tk.W)
                 label_widgets[label_key] = lbl
 
@@ -1469,19 +1908,20 @@ class MonitorGUI:
                     heading.configure(foreground="#000000")
                     lbl.configure(fg="#000000")
 
-            add_item(0, "Time", "时间", "time")
-            add_item(1, "Price", "价格", "mid")
-            add_item(2, "Delta", "净成交量", "delta")
-            add_item(3, f"Δ Sum ({self.cfg.delta_window}s)", "Delta累积", "delta_sum")
-            add_item(4, f"CVD ({self.cfg.cvd_window}s)", "累积Delta", "cvd")
+            add_item(0, "Price", "价格", "mid")
+            add_item(1, "Delta", "净成交量", "delta")
+            add_item(2, f"Δ Sum ({self.cfg.delta_window}s)", "Delta累积", "delta_sum")
+            add_item(3, f"CVD ({self.cfg.cvd_window}s)", "累积Delta", "cvd")
+            add_item(4, "Open Interest", "未平仓量", "oi")
             add_item(5, "OB Imbalance", "盘口不平衡", "ob")
             add_item(6, "Divergence", "背离信号", "divergence")
+            add_item(7, "策略", "策略建议", "strategy")
 
             self.metric_widgets[key] = label_widgets
 
         self._update_pair_selector()
 
-        chart_frame = ttk.LabelFrame(mainframe, text="15分钟滚动图 Realtime Charts", padding="6")
+        chart_frame = ttk.LabelFrame(mainframe, text="60分钟滚动图 Realtime Charts", padding="6")
         chart_frame.pack(fill=tk.BOTH, expand=True, pady=6)
         self.chart_frame = chart_frame
 
@@ -1574,6 +2014,102 @@ class MonitorGUI:
                 frame.grid_remove()
 
         self._update_chart_visibility()
+        self._refresh_all_charts()
+
+    def _on_timeframe_change(self) -> None:
+        selection = self.timeframe_var.get()
+        minutes = self.timeframe_minutes_map.get(selection, 60)
+        self.selected_timeframe_minutes = minutes
+        if minutes * 60 > self.cfg.history_seconds:
+            self.cfg.history_seconds = minutes * 60
+            self.history_seconds_var.set(self.cfg.history_seconds)
+        self._refresh_all_charts()
+
+    def _refresh_all_charts(self) -> None:
+        if not hasattr(self, "axes_price"):
+            return
+        for key, records in list(self.records_by_symbol.items()):
+            if records:
+                self._update_charts(key)
+
+    def _on_price_fill_clicked(self) -> None:
+        if self._price_fill_thread and self._price_fill_thread.is_alive():
+            return
+        try:
+            self.price_fill_button.state(["disabled"])
+        except Exception:
+            pass
+        thread = threading.Thread(target=self._price_fill_worker, daemon=True)
+        self._price_fill_thread = thread
+        thread.start()
+
+    def _price_fill_worker(self) -> None:
+        selection = self.timeframe_var.get()
+        minutes = self.timeframe_minutes_map.get(selection, 60)
+        seconds = max(60, minutes * 60)
+        updates: Dict[str, List[Dict[str, Any]]] = {}
+        for source in self.cfg.symbol_sources:
+            try:
+                records = fetch_rest_history(source, self.cfg, seconds_override=seconds)
+            except Exception as exc:
+                print(f"[warn] price fill failed for {source.normalized().display}: {exc}")
+                continue
+            if not records:
+                continue
+            updates[source.normalized().display] = records
+
+        def _apply() -> None:
+            self._apply_price_fill_updates(updates, seconds)
+
+        try:
+            self.root.after(0, _apply)
+        except tk.TclError:
+            pass
+
+    def _apply_price_fill_updates(self, updates: Dict[str, List[Dict[str, Any]]], seconds: int) -> None:
+        try:
+            self.price_fill_button.state(["!disabled"])
+        except Exception:
+            pass
+        self._price_fill_thread = None
+        if not updates:
+            return
+        history_limit = max(self.cfg.history_seconds, seconds)
+        if history_limit > self.cfg.history_seconds:
+            self.cfg.history_seconds = history_limit
+            self.history_seconds_var.set(self.cfg.history_seconds)
+        for key, new_records in updates.items():
+            existing = list(self.records_by_symbol.get(key, []))
+            merged_map: Dict[pd.Timestamp, Dict[str, Any]] = {}
+            for rec in existing:
+                ts = OrderFlowMonitor._ensure_naive(rec["timestamp"])
+                entry = dict(rec)
+                entry["timestamp"] = ts
+                merged_map[ts] = entry
+            for rec in new_records:
+                ts = OrderFlowMonitor._ensure_naive(rec.get("timestamp"))
+                entry = merged_map.get(ts)
+                if entry is None:
+                    entry = dict(rec)
+                else:
+                    for field in ("mid", "delta", "delta_sum", "cvd", "ob_imbalance", "buy_vol", "sell_vol", "oi"):
+                        if field not in rec:
+                            continue
+                        value = rec.get(field)
+                        if value is None:
+                            continue
+                        if isinstance(value, float) and pd.isna(value):
+                            continue
+                        entry[field] = value
+                entry["timestamp"] = ts
+                merged_map[ts] = entry
+            merged_records = [merged_map[ts] for ts in sorted(merged_map.keys())]
+            clipped = clip_records_to_window(merged_records, history_limit, assume_sorted=True)
+            self.records_by_symbol[key] = clipped
+            if clipped:
+                self._update_metrics(key, clipped[-1])
+                self._update_charts(key)
+        print(f"[info] price fill completed for timeframe {self.timeframe_var.get()} ({seconds}s)")
 
     def _update_chart_visibility(self) -> None:
         if not hasattr(self, "axes_price") or not hasattr(self, "canvas"):
@@ -1589,21 +2125,17 @@ class MonitorGUI:
             ax_price = self.axes_price[key]
             ax_cvd = self.axes_cvd[key]
             ax_imbal = self.axes_imbalance[key]
+            ax_oi = self.axes_oi.get(key)
 
-            for ax in (ax_price, ax_cvd):
+            for ax in (ax_price, ax_cvd, ax_imbal, ax_oi):
+                if ax is None:
+                    continue
                 ax.set_visible(visible)
                 ax.get_xaxis().set_visible(visible)
                 ax.get_yaxis().set_visible(visible)
                 ax.patch.set_visible(visible)
                 for spine in ax.spines.values():
                     spine.set_visible(visible)
-
-            ax_imbal.set_visible(visible)
-            ax_imbal.get_xaxis().set_visible(visible)
-            ax_imbal.get_yaxis().set_visible(visible)
-            ax_imbal.patch.set_visible(visible)
-            for spine in ax_imbal.spines.values():
-                spine.set_visible(visible)
 
         self.canvas.draw_idle()
 
@@ -1612,22 +2144,23 @@ class MonitorGUI:
             self.hot_pairs_update_label.configure(text="")
             return
         dt_local = self.popular_pairs_timestamp.astimezone(self.display_tz)
-        self.hot_pairs_update_label.configure(text=f"热门更新: {dt_local.strftime('%Y-%m-%d %H:%M')}")
+        self.hot_pairs_update_label.configure(text=f"{dt_local.strftime('%Y-%m-%d %H:%M')}")
 
     def _setup_plot(self) -> None:
         ncols = max(1, len(self.cfg.symbol_sources))
-        figure = Figure(figsize=(11, 9.5), dpi=100)
+        figure = Figure(figsize=(11, 12), dpi=100)
         self.figure = figure
         self.axes_price: Dict[str, Any] = {}
         self.axes_cvd: Dict[str, Any] = {}
         self.axes_imbalance: Dict[str, Any] = {}
+        self.axes_oi: Dict[str, Any] = {}
 
         time_formatter = mdates.DateFormatter("%H:%M:%S", tz=self.display_tz)
         for col, source in enumerate(self.cfg.symbol_sources):
             key = source.normalized().display
             _, symbol_display = self._extract_display_parts(key)
 
-            ax_price = figure.add_subplot(3, ncols, col + 1)
+            ax_price = figure.add_subplot(4, ncols, col + 1)
             ax_price.set_title(f"{symbol_display} Price")
             ax_price.set_ylabel("Price")
             ax_price.grid(True, linestyle="--", alpha=0.3)
@@ -1636,7 +2169,7 @@ class MonitorGUI:
             ax_price.tick_params(axis='x', labelbottom=False)
             self.axes_price[key] = ax_price
 
-            ax_cvd = figure.add_subplot(3, ncols, ncols + col + 1, sharex=ax_price)
+            ax_cvd = figure.add_subplot(4, ncols, ncols + col + 1, sharex=ax_price)
             ax_cvd.set_title(f"{symbol_display} CVD", color="#ef6c00")
             ax_cvd.set_ylabel("CVD", color="#ef6c00")
             ax_cvd.grid(True, linestyle="--", alpha=0.3)
@@ -1647,7 +2180,7 @@ class MonitorGUI:
             ax_cvd.spines["left"].set_color("#ef6c00")
             self.axes_cvd[key] = ax_cvd
 
-            ax_imbal = figure.add_subplot(3, ncols, (2 * ncols) + col + 1, sharex=ax_price)
+            ax_imbal = figure.add_subplot(4, ncols, (2 * ncols) + col + 1, sharex=ax_price)
             ax_imbal.set_title(f"{symbol_display} OB Imbalance", color="#8e24aa")
             ax_imbal.set_ylabel("盘口不平衡", color="#8e24aa", labelpad=14)
             ax_imbal.yaxis.set_label_position("left")
@@ -1658,9 +2191,19 @@ class MonitorGUI:
             ax_imbal.spines["right"].set_linewidth(ax_imbal.spines["left"].get_linewidth())
             ax_imbal.grid(True, linestyle="--", alpha=0.3)
             ax_imbal.xaxis.set_major_formatter(time_formatter)
-            ax_imbal.tick_params(axis='x', rotation=20)
+            ax_imbal.tick_params(axis='x', rotation=20, labelbottom=False)
             ax_imbal.tick_params(axis='y', colors="#8e24aa")
             self.axes_imbalance[key] = ax_imbal
+
+            ax_oi = figure.add_subplot(4, ncols, (3 * ncols) + col + 1, sharex=ax_price)
+            ax_oi.set_title(f"{symbol_display} Open Interest", color="#3949ab")
+            ax_oi.set_ylabel("未平仓量", color="#3949ab", labelpad=14)
+            ax_oi.grid(True, linestyle="--", alpha=0.3)
+            ax_oi.xaxis.set_major_formatter(time_formatter)
+            ax_oi.tick_params(axis='x', rotation=20)
+            ax_oi.tick_params(axis='y', colors="#3949ab")
+            ax_oi.spines["left"].set_color("#3949ab")
+            self.axes_oi[key] = ax_oi
 
         self.canvas = FigureCanvasTkAgg(figure, master=self.chart_frame)
         self.canvas.draw()
@@ -1720,7 +2263,8 @@ class MonitorGUI:
         print(
             f"[info] 参数已更新: poll={self.cfg.poll_interval}s, "
             f"delta_window={self.cfg.delta_window}s, cvd_window={self.cfg.cvd_window}s, "
-            f"history={self.cfg.history_seconds}s, ob_smooth={self.cfg.imbalance_smooth_points}"
+            f"history={self.cfg.history_seconds}s, ob_smooth={self.cfg.imbalance_smooth_points}, "
+            f"strategy={'on' if self.cfg.strategy_enabled else 'off'}({self.cfg.strategy_lookback_seconds}s)"
         )
 
     def update_ui(self) -> None:
@@ -1778,9 +2322,6 @@ class MonitorGUI:
             return
 
         try:
-            timestamp = record.get('timestamp') or pd.Timestamp.utcnow().tz_localize("UTC")
-            labels['time'].set(self._format_display_time(timestamp))
-
             mid = record.get('mid')
             labels['mid'].set(f"{mid:.2f}" if isinstance(mid, (int, float)) else '--')
 
@@ -1790,6 +2331,19 @@ class MonitorGUI:
             labels['delta'].set(f"{delta:.3f}")
             labels['delta_sum'].set(f"{delta_sum:.3f}")
             labels['cvd'].set(f"{cvd:.3f}")
+
+            oi_value_raw = record.get('oi')
+            if oi_value_raw is None and 'open_interest' in record:
+                oi_value_raw = record.get('open_interest')
+            oi_value = _safe_float(oi_value_raw)
+            if oi_value is None:
+                labels['oi'].set('--')
+                if widgets.get('oi') and widgets['oi'].winfo_exists():
+                    widgets['oi'].configure(fg='#37474f')
+            else:
+                labels['oi'].set(f"{oi_value:,.0f}")
+                if widgets.get('oi') and widgets['oi'].winfo_exists():
+                    widgets['oi'].configure(fg='#3949ab')
 
             ob_raw = record.get('ob_imbalance')
             ob = ob_raw
@@ -1829,6 +2383,40 @@ class MonitorGUI:
                 else:
                     widgets['divergence'].configure(fg='#37474f')
 
+            strategy_signal = str(record.get('strategy_signal') or 'HOLD')
+            signal_display = STRATEGY_SIGNAL_DISPLAY.get(strategy_signal, strategy_signal)
+            strategy_conf = record.get('strategy_confidence')
+            if isinstance(strategy_conf, (int, float)):
+                display_strategy = f"{signal_display} ({strategy_conf * 100:.0f}%)"
+            else:
+                display_strategy = signal_display
+
+            strategy_reason_raw = str(record.get('strategy_reason') or '').strip()
+            reason_parts = [part.strip() for part in strategy_reason_raw.split(",") if part.strip()]
+            translated_parts = [STRATEGY_REASON_DISPLAY.get(part, part) for part in reason_parts]
+            if not translated_parts and strategy_reason_raw:
+                translated_reason = STRATEGY_REASON_DISPLAY.get(strategy_reason_raw, strategy_reason_raw)
+            else:
+                translated_reason = "、".join(translated_parts)
+
+            if (
+                strategy_reason_raw
+                and strategy_reason_raw not in STRATEGY_REASON_SKIP
+                and translated_reason
+            ):
+                display_strategy = f"{display_strategy}\n{translated_reason}"
+
+            labels['strategy'].set(display_strategy)
+            if widgets.get('strategy') and widgets['strategy'].winfo_exists():
+                color = '#37474f'
+                if strategy_signal in {'LONG', 'LEAN_LONG'}:
+                    color = '#1b5e20' if strategy_signal == 'LONG' else '#2e7d32'
+                elif strategy_signal in {'SHORT', 'LEAN_SHORT'}:
+                    color = '#b71c1c' if strategy_signal == 'SHORT' else '#c62828'
+                elif strategy_signal == 'DISABLED':
+                    color = '#78909c'
+                widgets['strategy'].configure(fg=color)
+
             if widgets['delta'].winfo_exists():
                 if delta > 0:
                     widgets['delta'].configure(fg='#2e7d32')
@@ -1854,36 +2442,61 @@ class MonitorGUI:
             0.0 if pd.isna(r.get('ob_imbalance')) else float(r.get('ob_imbalance', 0.0))
             for r in records
         ]
+        oi_values: List[float] = []
+        for r in records:
+            oi_raw = r.get('oi')
+            if oi_raw is None and 'open_interest' in r:
+                oi_raw = r.get('open_interest')
+            oi_val = _safe_float(oi_raw)
+            oi_values.append(oi_val if oi_val is not None else float('nan'))
         smooth_window = max(1, self.cfg.imbalance_smooth_points)
         if smooth_window > 1:
             series = pd.Series(imbalance, dtype="float64")
             imbalance = series.rolling(window=smooth_window, min_periods=1).mean().tolist()
 
+        window_start: Optional[pd.Timestamp] = None
+        if times:
+            window_end = times[-1]
+            span_minutes = max(1, self.selected_timeframe_minutes)
+            candidate_start = window_end - pd.Timedelta(minutes=span_minutes)
+            filtered_samples = [
+                (ts, pr, cv, im, oi)
+                for ts, pr, cv, im, oi in zip(times, price, cvd, imbalance, oi_values)
+                if ts >= candidate_start
+            ]
+            if filtered_samples:
+                filtered_times, filtered_price, filtered_cvd, filtered_imbal, filtered_oi = zip(
+                    *filtered_samples
+                )
+                times = list(filtered_times)
+                price = list(filtered_price)
+                cvd = list(filtered_cvd)
+                imbalance = list(filtered_imbal)
+                oi_values = list(filtered_oi)
+                window_start = candidate_start
+
         ax_price = self.axes_price[symbol_key]
         ax_cvd = self.axes_cvd[symbol_key]
         ax_imbal = self.axes_imbalance[symbol_key]
+        ax_oi = self.axes_oi[symbol_key]
 
-        ax_price.clear()
-        ax_cvd.clear()
-        ax_imbal.clear()
+        for axis in (ax_price, ax_cvd, ax_imbal, ax_oi):
+            axis.clear()
 
         ax_price.plot(times, price, color='#1976d2', label='Price')
         ax_price.set_title(f"{symbol_display} Price")
         ax_price.set_ylabel('Price')
         ax_price.grid(True, linestyle='--', alpha=0.3)
         ax_price.xaxis.set_major_formatter(self.time_formatter)
-        ax_price.tick_params(axis='x', rotation=20)
-        ax_price.tick_params(axis='x', labelbottom=False)
+        ax_price.tick_params(axis='x', rotation=20, labelbottom=False)
         ax_price.ticklabel_format(style='plain', useOffset=False, axis='y')
         ax_price.get_yaxis().get_major_formatter().set_scientific(False)
 
         ax_cvd.plot(times, cvd, color='#ef6c00', label='CVD', linewidth=1.6, zorder=5)
-        ax_cvd.set_title(f"{symbol_display} CVD", color='#ef6c00')
         ax_cvd.set_ylabel('CVD', color='#ef6c00')
         ax_cvd.grid(True, linestyle='--', alpha=0.3)
         ax_cvd.xaxis.set_major_formatter(self.time_formatter)
-        ax_cvd.tick_params(axis='x', rotation=20)
-        ax_cvd.tick_params(axis='x', labelbottom=False)
+        ax_cvd.tick_params(axis='x', rotation=20, labelbottom=False)
         ax_cvd.tick_params(axis='y', colors='#ef6c00')
         ax_cvd.spines['left'].set_color('#ef6c00')
         ax_cvd.axhline(0, color='#ef6c00', linewidth=1, linestyle='--', alpha=0.4, zorder=4)
@@ -1907,22 +2520,87 @@ class MonitorGUI:
         ax_imbal.spines['right'].set_linewidth(ax_imbal.spines['left'].get_linewidth())
         ax_imbal.grid(True, linestyle='--', alpha=0.3)
         ax_imbal.xaxis.set_major_formatter(self.time_formatter)
-        ax_imbal.tick_params(axis='x', rotation=20)
+        ax_imbal.tick_params(axis='x', rotation=20, labelbottom=False)
         ax_imbal.tick_params(axis='y', colors='#8e24aa')
+
+        ax_oi.set_ylabel('未平仓量', color='#3949ab', labelpad=14)
+        ax_oi.yaxis.set_label_position('left')
+        ax_oi.yaxis.set_ticks_position('left')
+        ax_oi.spines['left'].set_color('#3949ab')
+        ax_oi.grid(True, linestyle='--', alpha=0.3)
+        ax_oi.xaxis.set_major_formatter(self.time_formatter)
+        ax_oi.tick_params(axis='x', rotation=20)
+        ax_oi.tick_params(axis='y', colors='#3949ab')
+
+        oi_series = [val for val in oi_values if isinstance(val, (int, float)) and not pd.isna(val)]
+        if oi_series:
+            ax_oi.plot(
+                times,
+                oi_values,
+                color='#3949ab',
+                label='Open Interest',
+                linewidth=1.4,
+                alpha=0.9,
+                zorder=3,
+            )
+            ax_oi.ticklabel_format(style='plain', useOffset=False, axis='y')
+        else:
+            ax_oi.set_ylim(0, 1)
+            ax_oi.set_yticks([])
+            ax_oi.text(
+                0.5,
+                0.5,
+                "暂无未平仓量数据",
+                transform=ax_oi.transAxes,
+                ha='center',
+                va='center',
+                color='#3949ab',
+                alpha=0.6,
+            )
+        ax_oi.set_ylabel('未平仓量', color='#3949ab', labelpad=14)
+        ax_oi.yaxis.set_label_position('left')
+        ax_oi.yaxis.set_ticks_position('left')
+        ax_oi.spines['left'].set_color('#3949ab')
+        ax_oi.grid(True, linestyle='--', alpha=0.3)
+        ax_oi.xaxis.set_major_formatter(self.time_formatter)
+        ax_oi.tick_params(axis='x', rotation=20)
+        ax_oi.tick_params(axis='y', colors='#3949ab')
+        ax_oi.ticklabel_format(style='plain', useOffset=False, axis='y')
         price_values = [p for p in price if not pd.isna(p)]
         price_range = max(price_values) - min(price_values) if price_values else 0.0
         base_price = price_values[-1] if price_values else 1.0
         offset = max(price_range * 0.02, abs(base_price) * 0.0005, 0.5)
         min_offset = max(abs(offset), 1e-6)
+
+        span_styles: Dict[str, Tuple[str, float]] = {
+            "LONG": ("#c8e6c9", 0.35),
+            "LEAN_LONG": ("#e8f5e9", 0.25),
+            "SHORT": ("#ffcdd2", 0.35),
+            "LEAN_SHORT": ("#ffebee", 0.25),
+        }
+        latest_signal = records[-1].get('strategy_signal') if records else None
+        if latest_signal in span_styles and times:
+            fill_color, fill_alpha = span_styles[latest_signal]
+            latest_ts = OrderFlowMonitor._ensure_naive(records[-1]['timestamp'])
+            fill_start_ts = latest_ts - pd.Timedelta(seconds=self.cfg.strategy_lookback_seconds)
+            fill_start_dt = self._to_display_timestamp(fill_start_ts)
+            fill_end_dt = self._to_display_timestamp(latest_ts)
+            fill_start_dt = max(fill_start_dt, times[0])
+            fill_end_dt = max(fill_end_dt, fill_start_dt)
+            for axis in (ax_price, ax_cvd, ax_imbal, ax_oi):
+                axis.axvspan(fill_start_dt, fill_end_dt, color=fill_color, alpha=fill_alpha, zorder=0)
     
         cutoff_time = (
             times[-1] - pd.Timedelta(seconds=60) if times else self._to_display_timestamp(pd.Timestamp.utcnow())
         )
+        drawn_minutes: Set[pd.Timestamp] = set()
         for rec in records:
             div_label = rec.get('display_divergence') or rec.get('divergence')
             if not div_label or div_label == 'None':
                 continue
             ts = self._to_display_timestamp(rec['timestamp'])
+            if window_start is not None and ts < window_start:
+                continue
             if ts < cutoff_time:
                 continue
             until = rec.get('divergence_until')
@@ -1932,19 +2610,12 @@ class MonitorGUI:
             price_y = rec.get('mid')
             if price_y is None or pd.isna(price_y):
                 continue
-    
+
+            minute_key = ts.floor('min')
+            if minute_key in drawn_minutes:
+                continue
+
             if 'Bullish' in div_label:
-                ax_price.scatter(
-                    ts,
-                    float(price_y) + min_offset * 1.1,
-                    marker='v',
-                    s=120,
-                    color='#d32f2f',
-                    edgecolors='white',
-                    linewidths=0.6,
-                    zorder=6,
-                )
-            elif 'Bearish' in div_label:
                 ax_price.scatter(
                     ts,
                     float(price_y) - min_offset * 1.1,
@@ -1955,11 +2626,25 @@ class MonitorGUI:
                     linewidths=0.6,
                     zorder=6,
                 )
-    
+                drawn_minutes.add(minute_key)
+            elif 'Bearish' in div_label:
+                ax_price.scatter(
+                    ts,
+                    float(price_y) + min_offset * 1.1,
+                    marker='v',
+                    s=120,
+                    color='#d32f2f',
+                    edgecolors='white',
+                    linewidths=0.6,
+                    zorder=6,
+                )
+                drawn_minutes.add(minute_key)
+
         if len(times) > 1:
             ax_price.set_xlim(times[0], times[-1])
             ax_cvd.set_xlim(times[0], times[-1])
             ax_imbal.set_xlim(times[0], times[-1])
+            ax_oi.set_xlim(times[0], times[-1])
         self.figure.tight_layout()
         self.canvas.draw_idle()
 
@@ -2050,6 +2735,43 @@ def parse_args() -> MonitorConfig:
         help="Order-book imbalance smoothing window (points, 1=off)",
     )
     parser.add_argument("--divergence-window", type=int, default=None, help="Divergence window (seconds)")
+    parser.add_argument("--strategy-disabled", action="store_true", help="Disable strategy overlay integration")
+    parser.add_argument(
+        "--strategy-lookback",
+        type=int,
+        default=None,
+        help="Strategy evaluation window in seconds (default: 120)",
+    )
+    parser.add_argument(
+        "--strategy-delta-threshold",
+        type=float,
+        default=None,
+        help="Delta accumulation threshold for strategy bias",
+    )
+    parser.add_argument(
+        "--strategy-long-imbalance",
+        type=float,
+        default=None,
+        help="Minimum average order-book imbalance to favour long bias",
+    )
+    parser.add_argument(
+        "--strategy-short-imbalance",
+        type=float,
+        default=None,
+        help="Maximum average order-book imbalance to favour short bias",
+    )
+    parser.add_argument(
+        "--strategy-cvd-slope",
+        type=float,
+        default=None,
+        help="Minimum CVD slope (per second) for strategy confirmation",
+    )
+    parser.add_argument(
+        "--strategy-min-score",
+        type=float,
+        default=None,
+        help="Minimum confidence score (0-1) required before issuing LONG/SHORT",
+    )
     parser.add_argument("--influx-url", type=str, default=None, help="InfluxDB base URL (e.g. http://localhost:8086)")
     parser.add_argument("--influx-token", type=str, default=None, help="InfluxDB API token")
     parser.add_argument("--influx-org", type=str, default=None, help="InfluxDB organisation")
@@ -2099,6 +2821,45 @@ def parse_args() -> MonitorConfig:
         if imbalance_default:
             try:
                 cfg.imbalance_smooth_points = max(1, int(imbalance_default))
+            except (TypeError, ValueError):
+                pass
+        strategy_enabled_default = getattr(app_config, "DEFAULT_STRATEGY_ENABLED", None)
+        if strategy_enabled_default is not None:
+            cfg.strategy_enabled = bool(strategy_enabled_default)
+        strategy_lookback_default = getattr(app_config, "DEFAULT_STRATEGY_LOOKBACK_SECONDS", None)
+        if strategy_lookback_default is not None:
+            try:
+                cfg.strategy_lookback_seconds = max(30, int(strategy_lookback_default))
+            except (TypeError, ValueError):
+                pass
+        strategy_delta_default = getattr(app_config, "DEFAULT_STRATEGY_DELTA_THRESHOLD", None)
+        if strategy_delta_default is not None:
+            try:
+                cfg.strategy_delta_threshold = float(strategy_delta_default)
+            except (TypeError, ValueError):
+                pass
+        strategy_long_imbalance_default = getattr(app_config, "DEFAULT_STRATEGY_LONG_IMBALANCE", None)
+        if strategy_long_imbalance_default is not None:
+            try:
+                cfg.strategy_long_imbalance = float(strategy_long_imbalance_default)
+            except (TypeError, ValueError):
+                pass
+        strategy_short_imbalance_default = getattr(app_config, "DEFAULT_STRATEGY_SHORT_IMBALANCE", None)
+        if strategy_short_imbalance_default is not None:
+            try:
+                cfg.strategy_short_imbalance = float(strategy_short_imbalance_default)
+            except (TypeError, ValueError):
+                pass
+        strategy_slope_default = getattr(app_config, "DEFAULT_STRATEGY_CVD_SLOPE_THRESHOLD", None)
+        if strategy_slope_default is not None:
+            try:
+                cfg.strategy_cvd_slope_threshold = float(strategy_slope_default)
+            except (TypeError, ValueError):
+                pass
+        strategy_min_score_default = getattr(app_config, "DEFAULT_STRATEGY_MIN_SIGNAL_SCORE", None)
+        if strategy_min_score_default is not None:
+            try:
+                cfg.strategy_min_signal_score = min(max(float(strategy_min_score_default), 0.0), 1.0)
             except (TypeError, ValueError):
                 pass
         poll_default = getattr(app_config, "DEFAULT_POLL_INTERVAL", None)
@@ -2165,6 +2926,20 @@ def parse_args() -> MonitorConfig:
         cfg.imbalance_smooth_points = max(1, args.imbalance_smooth)
     if args.divergence_window is not None:
         cfg.divergence_window = max(10, args.divergence_window)
+    if args.strategy_disabled:
+        cfg.strategy_enabled = False
+    if args.strategy_lookback is not None:
+        cfg.strategy_lookback_seconds = max(30, args.strategy_lookback)
+    if args.strategy_delta_threshold is not None:
+        cfg.strategy_delta_threshold = float(args.strategy_delta_threshold)
+    if args.strategy_long_imbalance is not None:
+        cfg.strategy_long_imbalance = float(args.strategy_long_imbalance)
+    if args.strategy_short_imbalance is not None:
+        cfg.strategy_short_imbalance = float(args.strategy_short_imbalance)
+    if args.strategy_cvd_slope is not None:
+        cfg.strategy_cvd_slope_threshold = float(args.strategy_cvd_slope)
+    if args.strategy_min_score is not None:
+        cfg.strategy_min_signal_score = min(max(float(args.strategy_min_score), 0.0), 1.0)
     if args.startup_backfill is not None:
         cfg.startup_backfill_seconds = max(0, args.startup_backfill)
     if args.history_cache is not None:
