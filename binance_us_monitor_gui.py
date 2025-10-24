@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Multi-symbol Tkinter GUI for Binance US order-flow monitoring.
+"""Multi-symbol Tkinter GUI for multi-exchange order-flow monitoring.
 
 Highlights:
-    - Streams aggTrade + bookTicker for BTCUSDT and ETHUSDT (configurable).
+    - Streams trades + top-of-book data for BTCUSDT and ETHUSDT (configurable).
     - Displays rolling Delta (30s), rolling CVD (60s), order-book imbalance,
       and divergence hints per symbol.
     - 2x2 Matplotlib layout: price+CVD (left column) and imbalance (right column)
@@ -134,6 +134,8 @@ STRATEGY_REASON_DISPLAY = {
     "Delta Sell": "Delta净卖",
     "CVD Up": "CVD上行",
     "CVD Down": "CVD下行",
+    "OI Rising": "OI上升",
+    "OI Falling": "OI下降",
     "Await alignment": "等待共振",
     "Strategy overlay disabled": "策略功能关闭",
 }
@@ -240,6 +242,8 @@ def normalize_exchange_symbol(exchange: str, symbol: str) -> Tuple[str, str]:
                         break
         if "-" not in symbol_l:
             raise ValueError(f"Unsupported Coinbase symbol format: {symbol}")
+    elif exchange_l == "mexc":
+        symbol_l = symbol_l.replace("-", "")
     elif exchange_l == "okx":
         if "-" not in symbol_l:
             for quote in OKX_SPOT_QUOTES:
@@ -450,7 +454,7 @@ REST_TIMEOUT = 10
 class KrakenFuturesOI:
     """Simple cached fetcher for Kraken Futures open-interest values."""
 
-    API_URL = "https://futures.kraken.com/derivatives/api/v3/openinterest"
+    API_URL = "https://futures.kraken.com/derivatives/api/v3/tickers"
     CACHE_TTL = 30  # seconds
 
     def __init__(self) -> None:
@@ -474,7 +478,7 @@ class KrakenFuturesOI:
                 print(f"[warn] Kraken OI fetch failed: {exc}")
                 self._last_fetch = now
                 return
-            items = payload.get("openInterest")
+            items = payload.get("tickers")
             if not isinstance(items, list):
                 self._last_fetch = now
                 return
@@ -524,7 +528,7 @@ def _build_records_from_trades(
         return []
     trades_sorted = sorted(trades, key=lambda item: item["timestamp"])
     bucket_seconds = 1
-    bucket_freq = f"{bucket_seconds}S"
+    bucket_freq = f"{bucket_seconds}s"
     buckets: Dict[pd.Timestamp, Dict[str, Any]] = {}
     for trade in trades_sorted:
         ts = trade["timestamp"]
@@ -663,11 +667,73 @@ def _fetch_binance_rest_history(source: SymbolSource, seconds: int, cfg: Monitor
     oi_symbol = resolve_kraken_oi_symbol(source.symbol.upper().replace("/", "-"))
     return _build_records_from_trades(normalized, cfg, seconds, ob_mid, ob_imbalance, source, oi_symbol)
 
+def _fetch_mexc_rest_history(source: SymbolSource, seconds: int, cfg: MonitorConfig) -> List[Dict[str, Any]]:
+    if requests is None:
+        return []
+    symbol = source.symbol.upper().replace("-", "")
+    try:
+        resp = requests.get(
+            "https://api.mexc.com/api/v3/aggTrades",
+            params={"symbol": symbol, "limit": 1000},
+            timeout=REST_TIMEOUT,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+    except Exception:
+        return []
+    if not isinstance(payload, list):
+        return []
+    cutoff = pd.Timestamp.utcnow().tz_localize(None) - pd.Timedelta(seconds=seconds)
+    normalized: List[Dict[str, Any]] = []
+    for item in payload:
+        ts_raw = item.get("T")
+        if ts_raw is None:
+            continue
+        try:
+            ts = pd.Timestamp(int(ts_raw), unit="ms").tz_localize(None)
+        except Exception:
+            continue
+        if ts < cutoff:
+            continue
+        price = _safe_float(item.get("p"))
+        qty = _safe_float(item.get("q"))
+        if price is None or qty is None:
+            continue
+        side = -1 if item.get("m") else 1
+        normalized.append({"timestamp": ts, "price": price, "size": qty, "side": side})
+
+    if not normalized:
+        return []
+    normalized.sort(key=lambda entry: entry["timestamp"])
+    ob_mid = None
+    ob_imbalance = 0.0
+    try:
+        ob_resp = requests.get(
+            "https://api.mexc.com/api/v3/ticker/bookTicker",
+            params={"symbol": symbol},
+            timeout=REST_TIMEOUT,
+        )
+        ob_resp.raise_for_status()
+        book = ob_resp.json()
+        bid = _safe_float(book.get("bidPrice"))
+        ask = _safe_float(book.get("askPrice"))
+        bid_qty = _safe_float(book.get("bidQty")) or 0.0
+        ask_qty = _safe_float(book.get("askQty")) or 0.0
+        if bid is not None and ask is not None:
+            ob_mid = (bid + ask) / 2
+        denom = bid_qty + ask_qty
+        if denom > 0:
+            ob_imbalance = (bid_qty - ask_qty) / denom
+    except Exception:
+        pass
+    oi_symbol = resolve_kraken_oi_symbol(source.symbol.upper().replace("/", "-"))
+    return _build_records_from_trades(normalized, cfg, seconds, ob_mid, ob_imbalance, source, oi_symbol)
+
 def _fetch_coinbase_candles(product_id: str, minutes: int) -> List[Dict[str, Any]]:
     if requests is None:
         return []
     minutes = max(1, minutes)
-    end_time = pd.Timestamp.utcnow().ceil("T")
+    end_time = pd.Timestamp.utcnow().ceil("min")
     start_time = end_time - pd.Timedelta(minutes=minutes)
     params = {
         "granularity": 60,
@@ -829,6 +895,8 @@ def fetch_rest_history(
             return _fetch_binance_rest_history(normalized, seconds, cfg)
         if normalized.exchange == "coinbase":
             return _fetch_coinbase_rest_history(normalized, seconds, cfg)
+        if normalized.exchange == "mexc":
+            return _fetch_mexc_rest_history(normalized, seconds, cfg)
     except Exception as exc:
         print(f"[warn] REST backfill failed for {normalized.display}: {exc}")
     return []
@@ -899,6 +967,7 @@ class InfluxPublisher:
             "strategy_ob_avg",
             "strategy_delta_sum",
             "strategy_cvd_slope",
+            "strategy_oi_change",
         ):
             value = record.get(field)
             if value is None:
@@ -971,7 +1040,7 @@ class InfluxPublisher:
 
 
 class OrderFlowMonitor:
-    """Order-flow monitor supporting multiple exchanges (Binance US, Bybit)."""
+    """Order-flow monitor supporting Binance US, Coinbase, Bybit, OKX, and MEXC."""
 
     def __init__(
         self,
@@ -1007,6 +1076,13 @@ class OrderFlowMonitor:
             except ValueError as exc:
                 raise ValueError(f"Invalid OKX symbol '{self.symbol}'") from exc
             self.okx_inst_id = normalized_symbol.upper()
+        self.mexc_symbol: Optional[str] = None
+        self.mexc_last_trade_time_ms: int = 0
+        self.mexc_trade_seen: Deque[str] = deque()
+        self.mexc_trade_seen_set: Set[str] = set()
+        self.mexc_trade_seen_max: int = 3000
+        if self.exchange == "mexc":
+            self.mexc_symbol = self.symbol_upper.replace("-", "")
 
         self.ticks: Deque[Tuple[pd.Timestamp, float, float, int]] = deque()
         self.book: Deque[Tuple[pd.Timestamp, float, float, float, float]] = deque()
@@ -1017,6 +1093,7 @@ class OrderFlowMonitor:
         self.delta_sum_value: float = 0.0
         self.cvd_value: float = 0.0
         self.kraken_oi_symbol: Optional[str] = resolve_kraken_oi_symbol(self.symbol_upper.replace("_", "-"))
+        print(f"[info] {self.symbol_key} mapped to Kraken OI symbol: {self.kraken_oi_symbol or 'None'}")
 
         self.ws_app: Optional[websocket.WebSocketApp] = None
         self.stop_event = threading.Event()
@@ -1268,6 +1345,107 @@ class OrderFlowMonitor:
             with self.lock:
                 self.book.append((ts, bid_price, bid_qty, ask_price, ask_qty))
 
+    def _mexc_register_trade_key(self, key: str) -> bool:
+        if key in self.mexc_trade_seen_set:
+            return False
+        self.mexc_trade_seen.append(key)
+        self.mexc_trade_seen_set.add(key)
+        if len(self.mexc_trade_seen) > self.mexc_trade_seen_max:
+            old = self.mexc_trade_seen.popleft()
+            self.mexc_trade_seen_set.discard(old)
+        return True
+
+    def _mexc_poll_once(self) -> None:
+        if requests is None or not self.mexc_symbol:
+            return
+        symbol = self.mexc_symbol
+        new_ticks: List[Tuple[pd.Timestamp, float, float, int]] = []
+        try:
+            trades_resp = requests.get(
+                "https://api.mexc.com/api/v3/trades",
+                params={"symbol": symbol, "limit": 200},
+                timeout=REST_TIMEOUT,
+            )
+            trades_resp.raise_for_status()
+            payload = trades_resp.json()
+        except Exception as exc:
+            print(f"[{self.symbol_key}] mexc trades fetch failed: {exc}")
+            payload = []
+        if isinstance(payload, list):
+            ordered = sorted(
+                (item for item in payload if isinstance(item, dict)),
+                key=lambda item: item.get("time") or 0,
+            )
+            for trade in ordered:
+                ts_raw = trade.get("time")
+                if ts_raw is None:
+                    continue
+                try:
+                    ts_int = int(ts_raw)
+                except (TypeError, ValueError):
+                    continue
+                if ts_int < self.mexc_last_trade_time_ms:
+                    continue
+                price = _safe_float(trade.get("price"))
+                qty = _safe_float(trade.get("qty"))
+                if price is None or qty is None or qty <= 0:
+                    continue
+                maker_flag = bool(trade.get("isBuyerMaker"))
+                side = -1 if maker_flag else 1
+                key = f"{ts_int}-{price}-{qty}-{side}"
+                if not self._mexc_register_trade_key(key):
+                    continue
+                if ts_int > self.mexc_last_trade_time_ms:
+                    self.mexc_last_trade_time_ms = ts_int
+                ts = self._ensure_naive(pd.Timestamp(ts_int, unit="ms"))
+                new_ticks.append((ts, price, qty, side))
+        if new_ticks:
+            with self.lock:
+                for entry in new_ticks:
+                    self.ticks.append(entry)
+        try:
+            ob_resp = requests.get(
+                "https://api.mexc.com/api/v3/ticker/bookTicker",
+                params={"symbol": symbol},
+                timeout=REST_TIMEOUT,
+            )
+            ob_resp.raise_for_status()
+            book = ob_resp.json()
+        except Exception as exc:
+            print(f"[{self.symbol_key}] mexc book fetch failed: {exc}")
+            return
+        bid_price = _safe_float(book.get("bidPrice"))
+        ask_price = _safe_float(book.get("askPrice"))
+        bid_qty = _safe_float(book.get("bidQty")) or 0.0
+        ask_qty = _safe_float(book.get("askQty")) or 0.0
+        ts = self._ensure_naive(pd.Timestamp.utcnow())
+        with self.lock:
+            self.book.append(
+                (
+                    ts,
+                    bid_price if bid_price is not None else float("nan"),
+                    bid_qty,
+                    ask_price if ask_price is not None else float("nan"),
+                    ask_qty,
+                )
+            )
+
+    def _run_mexc_poll_loop(self) -> None:
+        if requests is None:
+            print(f"[{self.symbol_key}] requests module missing, cannot poll MEXC REST endpoints")
+            while not self.stop_event.wait(5.0):
+                pass
+            return
+        if not self.mexc_symbol:
+            raise ValueError(f"MEXC symbol not resolved for {self.symbol_key}")
+        interval = max(float(self.cfg.poll_interval), 0.4)
+        while not self.stop_event.is_set():
+            try:
+                self._mexc_poll_once()
+            except Exception as exc:
+                print(f"[{self.symbol_key}] mexc poll error: {exc}")
+            self.stop_event.wait(interval)
+
     def on_error(self, _: websocket.WebSocketApp, error: Exception) -> None:
         print(f"[{self.symbol_key}] error: {error}")
 
@@ -1275,6 +1453,9 @@ class OrderFlowMonitor:
         print(f"[{self.symbol_key}] websocket closed")
 
     def run_ws(self) -> None:
+        if self.exchange == "mexc":
+            self._run_mexc_poll_loop()
+            return
         while not self.stop_event.is_set():
             if self.exchange == "bybit":
                 url = self._bybit_url()
@@ -1500,11 +1681,38 @@ class OrderFlowMonitor:
         elapsed = max((end_ts - start_ts).total_seconds(), 1.0)
         cvd_slope = (cvd_end - cvd_start) / elapsed
 
+        oi_samples: List[Tuple[pd.Timestamp, float]] = []
+        for r in relevant:
+            value = r.get("oi")
+            if value is None:
+                continue
+            try:
+                num = float(value)
+            except (TypeError, ValueError):
+                continue
+            if pd.isna(num):
+                continue
+            ts_value = self._ensure_naive(r["timestamp"])
+            oi_samples.append((ts_value, num))
+        oi_change_per_min = float("nan")
+        if len(oi_samples) >= 2:
+            oi_start = oi_samples[0][1]
+            oi_end = oi_samples[-1][1]
+            base = max(abs(oi_start), 1e-6)
+            elapsed_minutes = max(
+                (oi_samples[-1][0] - oi_samples[0][0]).total_seconds() / 60.0, 1e-6
+            )
+            oi_relative_change = (oi_end - oi_start) / base
+            oi_change_per_min = oi_relative_change / elapsed_minutes
+        oi_threshold = 0.01
+
         long_reasons: List[str] = []
         short_reasons: List[str] = []
 
-        metrics_available = 3
+        metrics_available = 4
         if math.isnan(ob_avg):
+            metrics_available -= 1
+        if math.isnan(oi_change_per_min):
             metrics_available -= 1
 
         if not math.isnan(ob_avg):
@@ -1512,6 +1720,12 @@ class OrderFlowMonitor:
                 long_reasons.append("OB Bid Bias")
             if ob_avg <= self.cfg.strategy_short_imbalance:
                 short_reasons.append("OB Ask Bias")
+
+        if not math.isnan(oi_change_per_min):
+            if oi_change_per_min >= oi_threshold:
+                long_reasons.append("OI Rising")
+            elif oi_change_per_min <= -oi_threshold:
+                short_reasons.append("OI Falling")
 
         if delta_sum >= self.cfg.strategy_delta_threshold:
             long_reasons.append("Delta Accum")
@@ -1580,6 +1794,7 @@ class OrderFlowMonitor:
             "strategy_ob_avg": ob_avg,
             "strategy_delta_sum": delta_sum,
             "strategy_cvd_slope": cvd_slope,
+            "strategy_oi_change": oi_change_per_min,
             "strategy_last_change": self.strategy_state.get("last_change"),
         }
         return info
@@ -1813,16 +2028,16 @@ class MonitorGUI:
         add_control(3, "图表秒数", self.history_seconds_var, 60, 3600, 30, "%d")
         add_control(4, "OB平滑点数", self.imbalance_smooth_var, 1, 200, 1, "%d")
 
-        ttk.Button(control_frame, text="应用 Apply", command=self.apply_parameters).grid(
-            row=0, column=5, padx=8, pady=2
-        )
+        button_frame = ttk.Frame(control_frame)
+        button_frame.grid(row=1, column=0, columnspan=7, sticky="w", pady=(4, 0))
+        ttk.Button(button_frame, text="应用 Apply", command=self.apply_parameters).pack(side=tk.LEFT, padx=(0, 8))
         self.price_fill_button = ttk.Button(
-            control_frame, text="Price Fill", command=self._on_price_fill_clicked
+            button_frame, text="Price Fill", command=self._on_price_fill_clicked
         )
-        self.price_fill_button.grid(row=0, column=6, padx=8, pady=2)
+        self.price_fill_button.pack(side=tk.LEFT)
 
         timeframe_frame = ttk.Frame(control_frame)
-        timeframe_frame.grid(row=1, column=0, columnspan=7, sticky="w", pady=(4, 0))
+        timeframe_frame.grid(row=2, column=0, columnspan=7, sticky="w", pady=(4, 0))
         ttk.Label(timeframe_frame, text="Price Span:").pack(side=tk.LEFT, padx=(0, 6))
         for label, _ in self.timeframe_presets:
             ttk.Radiobutton(
@@ -2716,12 +2931,12 @@ class MonitorGUI:
 
 
 def parse_args() -> MonitorConfig:
-    parser = argparse.ArgumentParser(description="Binance US / Bybit order-flow GUI")
+    parser = argparse.ArgumentParser(description="Multi-exchange (Binance US / Coinbase / Bybit / OKX / MEXC) order-flow GUI")
     parser.add_argument(
         "--symbols",
         nargs="+",
         default=None,
-        help="Symbols as exchange:symbol (e.g. binanceus:btcusdt, bybit:btcusdt)."
+        help="Symbols as exchange:symbol (e.g. binanceus:btcusdt, mexc:btcusdt, bybit:btcusdt)."
              " Default: binanceus:btcusdt binanceus:ethusdt",
     )
     parser.add_argument("--poll-interval", type=float, default=None, help="Refresh interval in seconds")
